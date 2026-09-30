@@ -1,0 +1,41 @@
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  margin: 0; padding: 0 16px 48px;
+  max-width: 900px; margin-inline: auto;
+  line-height: 1.4;
+}
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 16px 0; border-bottom: 1px solid #8884; margin-bottom: 16px;
+}
+h1 { font-size: 1.4rem; margin: 0; }
+h2 { font-size: 1.05rem; margin: 0 0 8px; }
+small { font-weight: normal; opacity: .6; }
+.badge {
+  font: 600 .8rem/1 ui-monospace, monospace;
+  padding: 4px 8px; border-radius: 6px; background: #8883;
+}
+.badge.bad { background: #e5484d33; color: #e5484d; }
+.badge.good { background: #30a46c33; color: #30a46c; }
+main { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+.card {
+  border: 1px solid #8884; border-radius: 10px; padding: 14px;
+}
+.card:last-child, .card:nth-child(1) { grid-column: 1 / -1; }
+input, textarea, button {
+  font: inherit; padding: 8px 10px; margin: 4px 4px 4px 0;
+  border-radius: 8px; border: 1px solid #8886; background: transparent; color: inherit;
+}
+input { min-width: 160px; }
+textarea { width: 100%; font-family: ui-monospace, monospace; font-size: .8rem; }
+button { cursor: pointer; background: #4f7cff22; border-color: #4f7cff66; }
+button:hover { background: #4f7cff44; }
+.hint { font-size: .8rem; opacity: .65; margin: 6px 0 0; }
+pre {
+  background: #8881; padding: 12px; border-radius: 8px;
+  overflow: auto; font-size: .8rem; max-height: 360px;
+}
+.note { padding: 6px 0; border-bottom: 1px dashed #8884; font-size: .9rem; }
+@media (max-width: 640px) { main { grid-template-columns: 1fr; } }

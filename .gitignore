@@ -1,0 +1,6 @@
+# runtime databases (recreated on boot)
+lab_vuln.db
+lab_secure.db
+*.db
+__pycache__/
+*.pyc

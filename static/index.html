@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Auth &amp; Crypto Lab</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Auth &amp; Crypto Lab</h1>
+    <span id="mode-badge" class="badge">mode: …</span>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Register</h2>
+      <input id="reg-username" placeholder="username" />
+      <input id="reg-password" placeholder="password" type="password" />
+      <input id="reg-email" placeholder="email (optional)" />
+      <input id="reg-fullname" placeholder="full name (optional)" />
+      <!-- This 'role' field exists to demonstrate the privilege-escalation bug.
+           In vuln mode the server trusts it. In secure mode it is ignored. -->
+      <input id="reg-role" placeholder="role (try 'admin' in vuln mode)" />
+      <button onclick="register()">Register</button>
+    </section>
+
+    <section class="card">
+      <h2>Login</h2>
+      <input id="login-username" placeholder="username" />
+      <input id="login-password" placeholder="password" type="password" />
+      <label><input id="login-remember" type="checkbox" /> remember me</label>
+      <button onclick="login()">Login</button>
+      <button onclick="logout()">Logout</button>
+      <p class="hint">Seeded users: admin/admin123, alice/password1, bob/hunter2</p>
+    </section>
+
+    <section class="card">
+      <h2>Session</h2>
+      <button onclick="me()">Who am I? (/api/me)</button>
+      <button onclick="adminUsers()">Admin: list users (/api/admin/users)</button>
+      <p class="hint">JWT (editable — tamper and re-run a call):</p>
+      <textarea id="token" rows="4" placeholder="no token yet"></textarea>
+    </section>
+
+    <section class="card">
+      <h2>User lookup <small>(IDOR target)</small></h2>
+      <input id="lookup-id" placeholder="user id, e.g. 1" />
+      <button onclick="getUser()">GET /api/users/:id</button>
+    </section>
+
+    <section class="card">
+      <h2>Search users <small>(SQLi target)</small></h2>
+      <input id="search-q" placeholder="name, or a UNION payload" size="40" />
+      <button onclick="search()">GET /api/search?q=</button>
+    </section>
+
+    <section class="card">
+      <h2>Notes <small>(stored XSS target)</small></h2>
+      <input id="note-title" placeholder="title" />
+      <input id="note-body" placeholder="body (try &lt;img src=x onerror=alert(1)&gt;)" size="40" />
+      <button onclick="createNote()">Add note</button>
+      <button onclick="listNotes()">Refresh notes</button>
+      <div id="notes"></div>
+    </section>
+
+    <section class="card">
+      <h2>Response</h2>
+      <pre id="out">—</pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

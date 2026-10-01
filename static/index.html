@@ -3,72 +3,68 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Auth &amp; Crypto Lab</title>
+  <title>Campus Portal</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <header>
-    <h1>Auth &amp; Crypto Lab</h1>
-    <span id="mode-badge" class="badge">mode: …</span>
-  </header>
 
-  <main>
-    <section class="card">
-      <h2>Register</h2>
-      <input id="reg-username" placeholder="username" />
-      <input id="reg-password" placeholder="password" type="password" />
-      <input id="reg-email" placeholder="email (optional)" />
-      <input id="reg-fullname" placeholder="full name (optional)" />
-      <!-- This 'role' field exists to demonstrate the privilege-escalation bug.
-           In vuln mode the server trusts it. In secure mode it is ignored. -->
-      <input id="reg-role" placeholder="role (try 'admin' in vuln mode)" />
-      <button onclick="register()">Register</button>
-    </section>
+  <!-- ============ AUTH: LOGIN ============ -->
+  <div id="login-screen" class="auth-screen">
+    <div class="auth-card">
+      <div class="auth-brand">🎓 Campus Portal</div>
+      <p class="auth-sub">Sign in to your student account</p>
+      <label>Username</label>
+      <input id="li-user" placeholder="username" autocomplete="username" />
+      <label>Password</label>
+      <input id="li-pass" type="password" placeholder="password" autocomplete="current-password" />
+      <div id="li-error" class="form-error"></div>
+      <button class="btn-primary btn-block" onclick="doLogin()">Sign in</button>
+      <p class="auth-switch">Don't have an account? <a onclick="showRegister()">Create one</a></p>
+    </div>
+  </div>
 
-    <section class="card">
-      <h2>Login</h2>
-      <input id="login-username" placeholder="username" />
-      <input id="login-password" placeholder="password" type="password" />
-      <label><input id="login-remember" type="checkbox" /> remember me</label>
-      <button onclick="login()">Login</button>
-      <button onclick="logout()">Logout</button>
-      <p class="hint">Seeded users: admin/admin123, alice/password1, bob/hunter2</p>
-    </section>
+  <!-- ============ AUTH: REGISTER ============ -->
+  <div id="register-screen" class="auth-screen hidden">
+    <div class="auth-card">
+      <div class="auth-brand">🎓 Campus Portal</div>
+      <p class="auth-sub">Create your student account</p>
+      <label>Full name</label>
+      <input id="rg-name" placeholder="Your name" />
+      <label>Username</label>
+      <input id="rg-user" placeholder="choose a username" />
+      <label>Email</label>
+      <input id="rg-email" placeholder="you@campus.edu" />
+      <label>Password</label>
+      <input id="rg-pass" type="password" placeholder="choose a password" />
+      <label>Account type</label>
+      <input value="Student" disabled />
+      <div id="rg-error" class="form-error"></div>
+      <button class="btn-primary btn-block" onclick="doRegister()">Create account</button>
+      <p class="auth-switch">Already have an account? <a onclick="showLogin()">Sign in</a></p>
+    </div>
+  </div>
 
-    <section class="card">
-      <h2>Session</h2>
-      <button onclick="me()">Who am I? (/api/me)</button>
-      <button onclick="adminUsers()">Admin: list users (/api/admin/users)</button>
-      <p class="hint">JWT (editable — tamper and re-run a call):</p>
-      <textarea id="token" rows="4" placeholder="no token yet"></textarea>
-    </section>
+  <!-- ============ APP ============ -->
+  <div id="app" class="hidden">
+    <header class="topbar">
+      <div class="brand">🎓 <span>Campus Portal</span></div>
+      <div class="topbar-right">
+        <span class="welcome">Welcome, <b id="tb-name">—</b></span>
+        <div class="usermenu">
+          <button class="avatar" id="avatar" onclick="toggleMenu(event)">?</button>
+          <div class="dropdown hidden" id="dropdown">
+            <a onclick="nav('profile')"><span>👤</span> Profile</a>
+            <a onclick="doLogout()"><span>⎋</span> Logout</a>
+          </div>
+        </div>
+      </div>
+    </header>
 
-    <section class="card">
-      <h2>User lookup <small>(IDOR target)</small></h2>
-      <input id="lookup-id" placeholder="user id, e.g. 1" />
-      <button onclick="getUser()">GET /api/users/:id</button>
-    </section>
-
-    <section class="card">
-      <h2>Search users <small>(SQLi target)</small></h2>
-      <input id="search-q" placeholder="name, or a UNION payload" size="40" />
-      <button onclick="search()">GET /api/search?q=</button>
-    </section>
-
-    <section class="card">
-      <h2>Notes <small>(stored XSS target)</small></h2>
-      <input id="note-title" placeholder="title" />
-      <input id="note-body" placeholder="body (try &lt;img src=x onerror=alert(1)&gt;)" size="40" />
-      <button onclick="createNote()">Add note</button>
-      <button onclick="listNotes()">Refresh notes</button>
-      <div id="notes"></div>
-    </section>
-
-    <section class="card">
-      <h2>Response</h2>
-      <pre id="out">—</pre>
-    </section>
-  </main>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main id="content"></main>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

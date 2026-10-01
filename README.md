@@ -1,116 +1,96 @@
-# Auth & Crypto Lab — a deliberately vulnerable web app
+# Campus — Student Management System
 
-A small, intentionally insecure web application for practicing **both** offensive
-(red-team) and defensive (blue-team) skills, in the spirit of OWASP Juice Shop /
-DVWA / WebGoat. Every vulnerability is documented and paired with a working fix.
+A small student management system (students, professors, admins) built to study
+common web-application security flaws and their fixes: SQL injection, broken JWT
+authentication, IDOR, broken access control, insecure password storage, plus a
+practical look at encryption and digital signatures.
 
-> ⚠️ **This app is insecure on purpose.** Run it only on your own machine, bound
-> to `127.0.0.1`. Never deploy it to a shared or public host.
-
-## The one-switch design
-
-The same code contains the vulnerable *and* the patched implementation of every
-issue. An environment variable chooses which runs:
+The application ships in two builds, selected with an environment variable:
 
 ```bash
-python3 app.py                 # APP_MODE=vuln   (default) — everything is broken
-APP_MODE=secure python3 app.py # patched — attacks below should now fail
+python3 app.py                    # vuln build  (default)  — contains the flaws
+APP_MODE=secure python3 app.py    # secure build           — the patched version
 ```
 
-Attack it in `vuln` mode, apply your understanding, then flip to `secure` mode
-and confirm the same exploit no longer works. In the source, the two branches sit
-next to each other, tagged `# VULN:` and `# SECURE:`.
+Both builds share the same code. Vulnerable branches are tagged `# VULN:` and the
+corresponding fix `# SECURE:`, so you can read them side by side, exploit the vuln
+build, then switch to the secure build and confirm the same request now fails.
+
+## Features
+
+| Role | Can do |
+|------|--------|
+| **Student** | see own courses, grades and certifications; send/read messages |
+| **Professor** | see own courses and students; enter grades; messages |
+| **Admin** | manage all users; issue (sign) certifications; full messaging |
+
+Cross-cutting: JWT login, private messaging, digitally-signed certifications, and
+encrypted message storage (secure build).
 
 ## Requirements
 
-- **Python 3.8+** — standard library only, **no `pip install` needed**.
-- (Optional) the `sqlite3` CLI, only if you want to inspect the DB by hand.
-
-The lab is written in Python because it needs a *real* database driver to teach
-SQL injection honestly: `sqlite3.execute(sql, params)` binds values on a separate
-channel (the fix), versus f-string concatenation (the bug). Note the comment
-marker is therefore `# VULN:` (Python) rather than the `// VULN:` in the brief —
-the substance is identical.
-
-## Setup & run
+- Python 3.8+
+- The `cryptography` package (AES-GCM encryption and Ed25519 signatures):
 
 ```bash
-cd art_de_protection
-
-# 1. (optional) create a fresh database — the app also auto-creates one on boot
-python3 db.py vuln
-python3 db.py secure
-
-# 2. run it
-python3 app.py                      # http://127.0.0.1:3000  (vulnerable)
-#   or
-APP_MODE=secure python3 app.py      # patched
-
-# helpful env vars:
-#   PORT=3001        change the port
-#   RESET_DB=1       wipe & reseed the DB for this mode on boot
-#   JWT_SECRET=...   override the (intentionally weak) signing key
+pip install -r requirements.txt
 ```
 
-Open <http://127.0.0.1:3000> for a clickable UI, or drive the JSON API directly
-with `curl` / **Burp Suite** (send requests through Burp's proxy on `127.0.0.1:8080`).
+## Run
 
-## Seeded accounts
+```bash
+# vulnerable build
+python3 app.py                      # http://127.0.0.1:3000
 
-| username | password   | role  |
-|----------|------------|-------|
-| `admin`  | `admin123` | admin |
-| `alice`  | `password1`| user  |
-| `bob`    | `hunter2`  | user  |
+# secure build (on a different port so you can compare side by side)
+APP_MODE=secure PORT=3001 python3 app.py
 
-## The vulnerabilities
-
-Full exploit walkthroughs and patch explanations are in
-[VULNERABILITIES.md](VULNERABILITIES.md).
-
-| # | Class | Where | Fixed by |
-|---|-------|-------|----------|
-| 1 | SQL injection | `/api/login`, `/api/search` | parameterized queries |
-| 2 | Authentication bypass | JWT verify + remember-me cookie | HMAC verify, pin `alg`, server-side random tokens |
-| 3 | Privilege escalation | `/api/register`, `/api/admin/users` | server-assigned roles, authz from DB |
-| 4 | IDOR | `/api/users/:id` | ownership/role check, hide secrets |
-| 5 | Weak password hashing | `auth.hash_password` | PBKDF2-HMAC-SHA256 + per-user salt |
-| 6 | Stored XSS *(bonus)* | notes rendering | output encoding (`textContent` / `html.escape`) |
-
-## API reference
-
-| Method | Path | Notes |
-|--------|------|-------|
-| GET  | `/api/config` | returns the running mode |
-| POST | `/api/register` | `{username, password, email?, full_name?, role?}` |
-| POST | `/api/login` | `{username, password, remember?}` → `{token}` |
-| POST | `/api/logout` | clears remember-me |
-| GET  | `/api/me` | current user (needs `Authorization: Bearer <jwt>`) |
-| GET  | `/api/users/:id` | user profile (**IDOR**) |
-| GET  | `/api/admin/users` | all users incl. secrets (**admin only**) |
-| GET  | `/api/search?q=` | search users by name (**SQLi**) |
-| GET  | `/api/notes` | your notes |
-| POST | `/api/notes` | `{title, body}` (**stored XSS**) |
-
-## Project layout
-
-```
-art_de_protection/
-├── app.py              # HTTP server, routing, all endpoints (vuln + secure branches)
-├── auth.py             # JWT (HMAC-SHA256), password hashing, remember-me tokens
-├── db.py               # sqlite3 access: vuln_query vs safe_query, init + seed
-├── schema.sql          # database schema (the deliverable "DB schema")
-├── static/             # minimal frontend (index.html, app.js, style.css)
-├── README.md
-├── VULNERABILITIES.md  # per-vuln: exploit steps + patch
-├── ARCHITECTURE.md     # component & data-flow diagram
-└── lab_vuln.db /
-    lab_secure.db       # created on first run (git-ignore these)
+# rebuild the database from scratch
+RESET_DB=1 python3 app.py
 ```
 
-## Suggested lab flow
+The database (`sms_vuln.db` / `sms_secure.db`) and the crypto keys (`keys/`) are
+created automatically on first run.
 
-1. Boot in `vuln` mode. Reproduce each finding in VULNERABILITIES.md with Burp.
-2. Read the matching `# VULN:` block and predict the fix.
-3. Boot in `secure` mode. Re-run the same requests; confirm they fail.
-4. Diff the `# VULN:` vs `# SECURE:` branches and write up *why* the fix works.
+## Demo accounts
+
+| Username | Password | Role |
+|----------|----------|------|
+| `admin` | `admin123` | admin |
+| `prof_smith` | `teach123` | professor |
+| `prof_jones` | `teach456` | professor |
+| `alice` | `password1` | student |
+| `bob` | `hunter2` | student |
+| `carol` | `qwerty` | student |
+
+## Vulnerabilities covered
+
+| # | Issue | Location |
+|---|-------|----------|
+| 1 | SQL injection (login bypass) | `POST /api/login` |
+| 2 | SQL injection (certifications) | `GET /api/certifications` |
+| 3 | Broken JWT (no signature check / `alg:none`) | `auth.jwt_decode_vuln` |
+| 4 | IDOR — read anyone's private chat | `GET /api/chat?chat_users[0]=..&chat_users[1]=..` |
+| 5 | Privilege escalation (client-chosen role) | `POST /api/register` |
+| 6 | Broken access control (grading, cert issuance, admin) | `POST /api/grades`, `POST /api/certifications`, `GET /api/admin/users` |
+| 7 | Insecure password hashing (unsalted MD5) | `auth.hash_password` |
+| 8 | Missing signature / encryption at rest | certifications & messages |
+
+Full exploit steps and fixes: **[VULNERABILITIES.md](VULNERABILITIES.md)**.
+Step-by-step live-demo script: **[DEMO.md](DEMO.md)**.
+Design & data flow: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
+## Project structure
+
+```
+app.py            HTTP server, routing, all endpoints (vuln + secure branches)
+auth.py           JWT (HMAC-SHA256) + password hashing
+crypto_utils.py   AES-GCM encryption + Ed25519 certificate signatures
+db.py             database access + seed data
+schema.sql        database schema
+static/           front-end (index.html, app.js, style.css)
+keys/             generated crypto keys (git-ignored)
+```
+
+> This project is intentionally insecure in its default build. Run it only on your
+> own machine (`127.0.0.1`); never expose it to a network.

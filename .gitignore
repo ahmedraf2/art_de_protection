@@ -1,6 +1,8 @@
 # runtime databases (recreated on boot)
-lab_vuln.db
-lab_secure.db
+sms_vuln.db
+sms_secure.db
 *.db
+# generated keys
+keys/
 __pycache__/
 *.pyc

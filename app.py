@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
-app.py — the deliberately vulnerable auth lab (standard library only).
+Student Management System.
 
-Run vulnerable (default):   python3 app.py
-Run patched:                APP_MODE=secure python3 app.py
-Reset the DB on boot:       RESET_DB=1 python3 app.py
+Run:
+    python3 app.py                      # default, http://127.0.0.1:3000
+    APP_MODE=secure python3 app.py      # hardened build
+    RESET_DB=1 python3 app.py           # rebuild + reseed the database
 
-Every vulnerability has a `# VULN:` comment on the vulnerable branch and a
-`# SECURE:` comment on the patched branch. The same endpoint contains both; the
-APP_MODE environment variable decides which one runs, so you can attack the app,
-then flip the switch and confirm your fix — without changing any code.
-
-See VULNERABILITIES.md for exploit walkthroughs (Burp Suite / curl) and the
-patch rationale for each finding.
+The application ships in two builds selected by APP_MODE. The 'vuln' build
+contains the flaws to be demonstrated; the 'secure' build is the patched version.
+Vulnerable branches are marked  # VULN:  and their fixes  # SECURE:.
 """
 
 import os
 import re
 import json
-import html
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import auth
 import db
+import crypto_utils as cu
 
 MODE = os.environ.get("APP_MODE", "vuln").lower()
 if MODE not in ("vuln", "secure"):
@@ -36,123 +32,65 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(HERE, "static")
 
 
-# ==========================================================================
-# Small helpers
-# ==========================================================================
-def load_user_by_id(conn, uid):
-    rows = db.safe_query(conn, "SELECT * FROM users WHERE id = ?", (uid,))
+def load_user(conn, uid):
+    rows = db.run(conn, "SELECT * FROM users WHERE id = ?", (uid,))
     return rows[0] if rows else None
 
 
-def load_user_by_username(conn, username):
-    rows = db.safe_query(conn, "SELECT * FROM users WHERE username = ?", (username,))
-    return rows[0] if rows else None
-
-
-def public_user(row, include_sensitive=False):
-    """Project a user row for output, hiding secrets unless explicitly allowed."""
-    out = {
-        "id": row["id"],
-        "username": row["username"],
-        "email": row["email"],
-        "full_name": row["full_name"],
-        "role": row["role"],
-        "created_at": row["created_at"],
-    }
-    if include_sensitive:
-        out["api_key"] = row["api_key"]
-        out["password_hash"] = row["password_hash"]
-        out["hash_scheme"] = row["hash_scheme"]
+def public_user(u, include_secrets=False):
+    out = {"id": u["id"], "username": u["username"], "full_name": u["full_name"],
+           "email": u["email"], "role": u["role"]}
+    if include_secrets:
+        out["password_hash"] = u["password_hash"]
+        out["hash_scheme"] = u["hash_scheme"]
     return out
 
 
-# ==========================================================================
-# Request handler
-# ==========================================================================
-class Handler(BaseHTTPRequestHandler):
-    server_version = "AuthLab/1.0"
-
-    # -- plumbing ----------------------------------------------------------
-    def log_message(self, fmt, *args):
-        print("[%s] %s" % (self.address_string(), fmt % args))
-
-    def _send(self, code, body, ctype="application/json", extra_headers=None):
-        if isinstance(body, (dict, list)):
-            body = json.dumps(body, indent=2)
-        if isinstance(body, str):
-            body = body.encode()
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra_headers or {}):
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _json_body(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if not length:
-            return {}
-        raw = self.rfile.read(length)
+def read_body(m):
+    if m.get("is_encrypted"):
         try:
-            return json.loads(raw)
+            return cu.decrypt(m["body"])
+        except Exception:
+            return "[decryption failed]"
+    return m["body"]
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "CampusPortal"
+
+    def log_message(self, fmt, *a):
+        print("[%s] %s" % (self.address_string(), fmt % a))
+
+    def send_json(self, code, body):
+        data = json.dumps(body, indent=2).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def body_json(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n))
         except Exception:
             return {}
 
-    def _cookies(self):
-        c = SimpleCookie()
-        if "Cookie" in self.headers:
-            c.load(self.headers["Cookie"])
-        return {k: m.value for k, m in c.items()}
-
-    def _bearer(self):
+    def bearer(self):
         h = self.headers.get("Authorization", "")
-        if h.startswith("Bearer "):
-            return h[len("Bearer "):].strip()
-        return None
+        return h[7:].strip() if h.startswith("Bearer ") else None
 
-    # -- identity ----------------------------------------------------------
-    def identity(self, conn):
-        """Return the caller's token payload (dict) or None.
+    def whoami(self, conn):
+        """Decode the caller's JWT. Which verifier runs depends on the build."""
+        tok = self.bearer()
+        if not tok:
+            return None
+        if MODE == "vuln":
+            return auth.jwt_decode_vuln(tok)     # does not verify the signature
+        return auth.jwt_decode_secure(tok)       # verifies alg + signature + exp
 
-        Tries the Authorization: Bearer JWT first, then the remember-me cookie.
-        The verification behavior differs by mode (see auth.py).
-        """
-        token = self._bearer()
-        if token:
-            if MODE == "vuln":
-                payload = auth.jwt_decode_vuln(token)   # does NOT verify signature
-            else:
-                payload = auth.jwt_decode_secure(token)  # verifies alg+sig+exp
-            if payload:
-                return payload
-
-        cookies = self._cookies()
-        rc = cookies.get("remember")
-        if rc:
-            if MODE == "vuln":
-                # VULN: trust base64(username) with no signature or lookup.
-                uname = auth.remember_username_from_vuln_cookie(rc)
-                if uname:
-                    u = load_user_by_username(conn, uname)
-                    if u:
-                        return {"sub": u["id"], "username": u["username"], "role": u["role"]}
-            else:
-                # SECURE: look up the hash of the random token, check expiry.
-                digest = auth.hash_remember_token(rc)
-                rows = db.safe_query(
-                    conn,
-                    "SELECT user_id FROM remember_tokens "
-                    "WHERE token_hash = ? AND expires_at > datetime('now')",
-                    (digest,),
-                )
-                if rows:
-                    u = load_user_by_id(conn, rows[0]["user_id"])
-                    if u:
-                        return {"sub": u["id"], "username": u["username"], "role": u["role"]}
-        return None
-
-    # -- routing -----------------------------------------------------------
     def do_GET(self):
         self.route("GET")
 
@@ -163,305 +101,405 @@ class Handler(BaseHTTPRequestHandler):
         self.route("PUT")
 
     def route(self, method):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        query = parse_qs(parsed.query)
+        p = urlparse(self.path)
+        path, query = p.path, parse_qs(p.query)
 
-        # static / frontend
-        if method == "GET" and (path == "/" or path == "/index.html"):
-            return self.serve_static("index.html")
+        if method == "GET" and path in ("/", "/index.html"):
+            return self.static("index.html")
         if method == "GET" and path.startswith("/static/"):
-            return self.serve_static(path[len("/static/"):])
+            return self.static(path[len("/static/"):])
 
         conn = db.get_conn(MODE)
         try:
-            for m, pattern, fn in ROUTES:
-                if m != method:
-                    continue
-                match = pattern.match(path)
-                if match:
-                    return fn(self, conn, match, query)
-            self._send(404, {"error": "not found", "path": path})
+            for m, pat, fn in ROUTES:
+                if m == method:
+                    match = pat.match(path)
+                    if match:
+                        return fn(self, conn, match, query)
+            self.send_json(404, {"error": "not found", "path": path})
         finally:
             conn.close()
 
-    def serve_static(self, rel):
-        rel = rel.lstrip("/")
-        full = os.path.normpath(os.path.join(STATIC_DIR, rel))
+    def static(self, rel):
+        full = os.path.normpath(os.path.join(STATIC_DIR, rel.lstrip("/")))
         if not full.startswith(STATIC_DIR) or not os.path.isfile(full):
-            return self._send(404, {"error": "not found"})
-        ctype = "text/html"
-        if full.endswith(".js"):
-            ctype = "application/javascript"
-        elif full.endswith(".css"):
-            ctype = "text/css"
+            return self.send_json(404, {"error": "not found"})
+        ctype = ("application/javascript" if full.endswith(".js")
+                 else "text/css" if full.endswith(".css") else "text/html")
         with open(full, "rb") as f:
-            self._send(200, f.read(), ctype=ctype)
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
 
 # ==========================================================================
-# Endpoints
+# Auth endpoints
 # ==========================================================================
 def h_config(self, conn, match, query):
-    """Expose the current mode so the frontend can mirror the XSS behavior."""
-    self._send(200, {"mode": MODE})
+    self.send_json(200, {"mode": MODE})
+
+
+def h_pubkey(self, conn, match, query):
+    self.send_json(200, {"issuer_public_key": cu.public_key_pem()})
 
 
 def h_register(self, conn, match, query):
-    body = self._json_body()
-    username = (body.get("username") or "").strip()
-    password = body.get("password") or ""
+    b = self.body_json()
+    username = (b.get("username") or "").strip()
+    password = b.get("password") or ""
     if not username or not password:
-        return self._send(400, {"error": "username and password required"})
-    if load_user_by_username(conn, username):
-        return self._send(409, {"error": "username taken"})
+        return self.send_json(400, {"error": "username and password required"})
+    if db.run(conn, "SELECT 1 FROM users WHERE username = ?", (username,)):
+        return self.send_json(409, {"error": "username already taken"})
 
     if MODE == "vuln":
-        # VULN (Privilege escalation): the role is taken from a client-controlled
-        # field. A registrant can simply send {"role": "admin"} to become admin.
-        role = body.get("role", "user")
+        role = b.get("role", "student")   # VULN: client can pick its own role
     else:
-        # SECURE: role is assigned by the server. Clients cannot request one.
-        role = "user"
+        role = "student"                  # SECURE: the server assigns the role
 
-    pwd_hash, salt, scheme = auth.hash_password(password, MODE)
-    api_key = "sk_live_" + auth.secrets.token_hex(16)
-    conn.execute(
-        "INSERT INTO users (username, email, full_name, password_hash, salt, "
-        "hash_scheme, role, api_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (username, body.get("email"), body.get("full_name"),
-         pwd_hash, salt, scheme, role, api_key),
-    )
+    h, salt, scheme = auth.hash_password(password, MODE)
+    conn.execute("INSERT INTO users (username, password_hash, salt, hash_scheme, role, "
+                 "full_name, email) VALUES (?,?,?,?,?,?,?)",
+                 (username, h, salt, scheme, role, b.get("full_name"), b.get("email")))
     conn.commit()
-    user = load_user_by_username(conn, username)
-    return self._send(201, {"ok": True, "user": public_user(user)})
+    u = db.run(conn, "SELECT * FROM users WHERE username = ?", (username,))[0]
+    self.send_json(201, {"user": public_user(u)})
 
 
 def h_login(self, conn, match, query):
-    body = self._json_body()
-    username = body.get("username") or ""
-    password = body.get("password") or ""
-    remember = bool(body.get("remember"))
+    b = self.body_json()
+    username = b.get("username") or ""
+    password = b.get("password") or ""
 
     if MODE == "vuln":
-        # VULN (SQL injection): username and password are concatenated straight
-        # into the SQL string. A payload like  username = admin'--  logs you in
-        # as admin with no password. See VULNERABILITIES.md.
+        # VULN: username/password concatenated straight into SQL.
+        #   username = admin'--   logs in as admin without a password.
         pwd_md5 = auth.hashlib.md5(password.encode()).hexdigest()
-        sql = (
-            "SELECT * FROM users WHERE username = '" + username + "' "
-            "AND password_hash = '" + pwd_md5 + "'"
-        )
-        rows = db.vuln_query(conn, sql)
+        sql = ("SELECT * FROM users WHERE username = '" + username +
+               "' AND password_hash = '" + pwd_md5 + "'")
+        rows = db.run_raw(conn, sql)
         user = rows[0] if rows else None
     else:
-        # SECURE: parameterized lookup, then a constant-time password check.
-        rows = db.safe_query(
-            conn, "SELECT * FROM users WHERE username = ?", (username,)
-        )
+        # SECURE: parameterized lookup + constant-time password verification.
+        rows = db.run(conn, "SELECT * FROM users WHERE username = ?", (username,))
         user = rows[0] if rows else None
         if user and not auth.verify_password(password, user):
             user = None
 
     if not user:
-        return self._send(401, {"error": "invalid credentials"})
-
-    token = auth.jwt_encode(
-        {"sub": user["id"], "username": user["username"], "role": user["role"]}
-    )
-
-    headers = []
-    if remember:
-        if MODE == "vuln":
-            # VULN (Auth bypass): remember-me cookie is just base64(username),
-            # unsigned and forgeable.
-            cookie = auth.remember_cookie_vuln(user)
-            headers.append(("Set-Cookie", f"remember={cookie}; Path=/; HttpOnly"))
-        else:
-            # SECURE: random token; only its hash is stored server-side.
-            raw, digest = auth.new_remember_token_secure()
-            conn.execute(
-                "INSERT INTO remember_tokens (token_hash, user_id, expires_at) "
-                "VALUES (?, ?, datetime('now', '+7 days'))",
-                (digest, user["id"]),
-            )
-            conn.commit()
-            headers.append((
-                "Set-Cookie",
-                f"remember={raw}; Path=/; HttpOnly; SameSite=Strict",
-            ))
-
-    return self._send(200, {"token": token, "user": public_user(user)},
-                      extra_headers=headers)
-
-
-def h_logout(self, conn, match, query):
-    if MODE == "secure":
-        cookies = self._cookies()
-        rc = cookies.get("remember")
-        if rc:
-            conn.execute(
-                "DELETE FROM remember_tokens WHERE token_hash = ?",
-                (auth.hash_remember_token(rc),),
-            )
-            conn.commit()
-    headers = [("Set-Cookie", "remember=; Path=/; Max-Age=0")]
-    return self._send(200, {"ok": True}, extra_headers=headers)
+        return self.send_json(401, {"error": "invalid username or password"})
+    token = auth.jwt_encode({"sub": user["id"], "username": user["username"],
+                             "role": user["role"]})
+    self.send_json(200, {"token": token, "user": public_user(user)})
 
 
 def h_me(self, conn, match, query):
-    ident = self.identity(conn)
+    ident = self.whoami(conn)
     if not ident:
-        return self._send(401, {"error": "authentication required"})
-    user = load_user_by_id(conn, ident.get("sub"))
-    if not user:
-        return self._send(401, {"error": "unknown user"})
-    return self._send(200, {"user": public_user(user)})
+        return self.send_json(401, {"error": "authentication required"})
+    u = load_user(conn, ident.get("sub"))
+    if not u:
+        return self.send_json(401, {"error": "unknown user"})
+    self.send_json(200, {"user": public_user(u)})
 
 
-def h_get_user(self, conn, match, query):
-    target_id = int(match.group("id"))
+# ==========================================================================
+# Academic endpoints
+# ==========================================================================
+def h_courses(self, conn, match, query):
+    """Course catalogue (any authenticated user)."""
+    if not self.whoami(conn):
+        return self.send_json(401, {"error": "authentication required"})
+    rows = db.run(conn,
+        "SELECT c.id, c.code, c.name, u.full_name AS professor "
+        "FROM courses c LEFT JOIN users u ON u.id = c.professor_id ORDER BY c.code")
+    self.send_json(200, {"courses": rows})
+
+
+def h_my_courses(self, conn, match, query):
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    uid, role = ident.get("sub"), ident.get("role")
+    if role == "professor":
+        rows = db.run(conn,
+            "SELECT c.id, c.code, c.name FROM courses c WHERE c.professor_id = ?", (uid,))
+    elif role == "admin":
+        rows = db.run(conn, "SELECT id, code, name FROM courses ORDER BY code")
+    else:
+        rows = db.run(conn,
+            "SELECT c.id, c.code, c.name FROM courses c "
+            "JOIN enrollments e ON e.course_id = c.id WHERE e.student_id = ?", (uid,))
+    self.send_json(200, {"courses": rows})
+
+
+def h_my_grades(self, conn, match, query):
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    rows = db.run(conn,
+        "SELECT g.grade, c.code, c.name FROM grades g JOIN courses c ON c.id = g.course_id "
+        "WHERE g.student_id = ? ORDER BY c.name", (ident.get("sub"),))
+    self.send_json(200, {"grades": rows})
+
+
+def h_certifications(self, conn, match, query):
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    student_id = query.get("student_id", [str(ident.get("sub"))])[0]
 
     if MODE == "vuln":
-        # VULN (IDOR): no authorization check. Anyone (even unauthenticated)
-        # can read ANY user's record, including api_key and password_hash.
-        user = load_user_by_id(conn, target_id)
-        if not user:
-            return self._send(404, {"error": "not found"})
-        return self._send(200, {"user": public_user(user, include_sensitive=True)})
+        # VULN: student_id concatenated into SQL (numeric context) AND no check
+        # that you may view this student's records.
+        #   ?student_id=0 OR 1=1                        -> every student's certs
+        #   ?student_id=0 UNION SELECT ... FROM users   -> exfiltrate other tables
+        sql = ("SELECT c.*, u.full_name FROM certifications c "
+               "JOIN users u ON u.id = c.student_id "
+               "WHERE c.student_id = " + str(student_id))
+        rows = db.run_raw(conn, sql)
     else:
-        # SECURE: must be authenticated; may only read your own record unless
-        # you are an admin; secrets are never exposed to non-owners.
-        ident = self.identity(conn)
-        if not ident:
-            return self._send(401, {"error": "authentication required"})
-        requester = load_user_by_id(conn, ident.get("sub"))
-        if not requester:
-            return self._send(401, {"error": "unknown user"})
-        is_self = requester["id"] == target_id
-        is_admin = requester["role"] == "admin"
-        if not (is_self or is_admin):
-            return self._send(403, {"error": "forbidden"})
-        user = load_user_by_id(conn, target_id)
-        if not user:
-            return self._send(404, {"error": "not found"})
-        return self._send(200, {"user": public_user(user, include_sensitive=is_self or is_admin)})
+        # SECURE: parameterized, and students may only read their own certs.
+        if ident.get("role") == "student" and str(student_id) != str(ident.get("sub")):
+            return self.send_json(403, {"error": "forbidden"})
+        rows = db.run(conn,
+            "SELECT c.*, u.full_name FROM certifications c "
+            "JOIN users u ON u.id = c.student_id WHERE c.student_id = ?", (student_id,))
+
+    for c in rows:
+        if MODE == "vuln":
+            # VULN: signatures are never checked, so a forged cert looks valid.
+            c["verified"] = True
+        else:
+            c["verified"] = cu.verify_cert(c["student_id"], c["title"], c["grade"],
+                                           c["issued_date"], c.get("signature"))
+    self.send_json(200, {"certifications": rows})
 
 
-def h_admin_users(self, conn, match, query):
-    ident = self.identity(conn)
+def h_issue_cert(self, conn, match, query):
+    ident = self.whoami(conn)
     if not ident:
-        return self._send(401, {"error": "authentication required"})
-
-    if MODE == "vuln":
-        # VULN (Privilege escalation / broken authz): the admin gate trusts the
-        # 'role' claim from the (unverified) token. Forge role=admin and you're in.
-        if ident.get("role") != "admin":
-            return self._send(403, {"error": "admins only"})
-    else:
-        # SECURE: re-derive the role from the database using the verified subject.
-        # The token's own 'role' claim is never trusted for authorization.
-        requester = load_user_by_id(conn, ident.get("sub"))
-        if not requester or requester["role"] != "admin":
-            return self._send(403, {"error": "admins only"})
-
-    users = db.safe_query(conn, "SELECT * FROM users ORDER BY id")
-    return self._send(200, {"users": [public_user(u, include_sensitive=True) for u in users]})
-
-
-def h_search(self, conn, match, query):
-    ident = self.identity(conn)
-    if not ident:
-        return self._send(401, {"error": "authentication required"})
-    q = (query.get("q", [""])[0])
-
-    if MODE == "vuln":
-        # VULN (SQL injection): the search term is concatenated into the query.
-        # A UNION-based payload can dump password_hash / api_key from any table.
-        sql = (
-            "SELECT id, username, full_name, email FROM users "
-            "WHERE full_name LIKE '%" + q + "%'"
-        )
-        rows = db.vuln_query(conn, sql)
-    else:
-        # SECURE: the term is bound as a parameter; the % wildcards are added
-        # to the *value*, not the SQL text.
-        rows = db.safe_query(
-            conn,
-            "SELECT id, username, full_name, email FROM users "
-            "WHERE full_name LIKE ?",
-            ("%" + q + "%",),
-        )
-    return self._send(200, {"results": rows})
-
-
-def h_list_notes(self, conn, match, query):
-    ident = self.identity(conn)
-    if not ident:
-        return self._send(401, {"error": "authentication required"})
-    rows = db.safe_query(
-        conn, "SELECT * FROM notes WHERE user_id = ? ORDER BY id", (ident.get("sub"),)
-    )
-    return self._send(200, {"notes": rows})
-
-
-def h_create_note(self, conn, match, query):
-    ident = self.identity(conn)
-    if not ident:
-        return self._send(401, {"error": "authentication required"})
-    body = self._json_body()
-    title = body.get("title") or ""
-    note_body = body.get("body") or ""
+        return self.send_json(401, {"error": "authentication required"})
+    b = self.body_json()
 
     if MODE == "secure":
-        # SECURE: neutralize markup on the way in (defense in depth; the primary
-        # XSS fix is output encoding on the frontend — see static/app.js).
-        title = html.escape(title)
-        note_body = html.escape(note_body)
-    # VULN: in vuln mode the raw note body is stored and later rendered with
-    # innerHTML by the frontend -> stored XSS.
+        # SECURE: only admins may issue certificates.
+        me = load_user(conn, ident.get("sub"))
+        if not me or me["role"] != "admin":
+            return self.send_json(403, {"error": "admins only"})
+    # VULN: no authorization check — any user can mint a certificate for anyone.
 
-    conn.execute(
-        "INSERT INTO notes (user_id, title, body) VALUES (?, ?, ?)",
-        (ident.get("sub"), title, note_body),
-    )
+    student_id, title = b.get("student_id"), b.get("title")
+    grade, issued = b.get("grade"), b.get("issued_date")
+    # SECURE: sign the certificate so it can be verified later. VULN: unsigned.
+    sig = cu.sign_cert(student_id, title, grade, issued) if MODE == "secure" else None
+    conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
+                 "signature) VALUES (?,?,?,?,?)", (student_id, title, grade, issued, sig))
     conn.commit()
-    return self._send(201, {"ok": True})
+    self.send_json(201, {"ok": True})
+
+
+def h_set_grade(self, conn, match, query):
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    b = self.body_json()
+    course_id, student_id, grade = b.get("course_id"), b.get("student_id"), b.get("grade")
+
+    if MODE == "secure":
+        # SECURE: only an admin, or the professor who owns this course, may grade.
+        me = load_user(conn, ident.get("sub"))
+        course = db.run(conn, "SELECT * FROM courses WHERE id = ?", (course_id,))
+        if not me or not course:
+            return self.send_json(400, {"error": "bad request"})
+        if not (me["role"] == "admin" or
+                (me["role"] == "professor" and course[0]["professor_id"] == me["id"])):
+            return self.send_json(403, {"error": "not authorized to grade this course"})
+    # VULN: no authorization check — any logged-in user (a student!) can set any
+    # grade for any student, including their own.
+
+    existing = db.run(conn, "SELECT id FROM grades WHERE course_id = ? AND student_id = ?",
+                      (course_id, student_id))
+    if existing:
+        conn.execute("UPDATE grades SET grade = ?, updated_by = ? WHERE id = ?",
+                     (grade, ident.get("sub"), existing[0]["id"]))
+    else:
+        conn.execute("INSERT INTO grades (course_id, student_id, grade, updated_by) "
+                     "VALUES (?,?,?,?)", (course_id, student_id, grade, ident.get("sub")))
+    conn.commit()
+    self.send_json(200, {"ok": True})
 
 
 # ==========================================================================
-# Route table
+# Chat / messaging
 # ==========================================================================
+def h_recent_messages(self, conn, match, query):
+    """Latest messages involving the current user, for the dashboard widget."""
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    uid = ident.get("sub")
+    rows = db.run(conn,
+        "SELECT m.*, s.full_name AS sender_name, r.full_name AS recipient_name "
+        "FROM messages m JOIN users s ON s.id = m.sender_id JOIN users r ON r.id = m.recipient_id "
+        "WHERE m.sender_id = ? OR m.recipient_id = ? ORDER BY m.id DESC LIMIT 5", (uid, uid))
+    out = []
+    for m in rows:
+        out.append({
+            "id": m["id"],
+            "with": m["recipient_name"] if m["sender_id"] == uid else m["sender_name"],
+            "with_id": m["recipient_id"] if m["sender_id"] == uid else m["sender_id"],
+            "outgoing": m["sender_id"] == uid,
+            "body": read_body(m),
+            "created_at": m["created_at"],
+        })
+    self.send_json(200, {"messages": out})
+
+
+def h_chats(self, conn, match, query):
+    """List the current user's conversations (one row per other participant)."""
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    uid = ident.get("sub")
+    rows = db.run(conn,
+        "SELECT m.*, s.full_name AS sn, s.username AS su, s.role AS srole, "
+        "r.full_name AS rn, r.username AS ru, r.role AS rrole "
+        "FROM messages m JOIN users s ON s.id = m.sender_id JOIN users r ON r.id = m.recipient_id "
+        "WHERE m.sender_id = ? OR m.recipient_id = ? ORDER BY m.id DESC", (uid, uid))
+    convos = {}
+    for m in rows:
+        outgoing = m["sender_id"] == uid
+        other_id = m["recipient_id"] if outgoing else m["sender_id"]
+        if other_id not in convos:
+            convos[other_id] = {
+                "user_id": other_id,
+                "name": m["rn"] if outgoing else m["sn"],
+                "username": m["ru"] if outgoing else m["su"],
+                "role": m["rrole"] if outgoing else m["srole"],
+                "last": read_body(m),
+                "created_at": m["created_at"],
+            }
+    self.send_json(200, {"chats": list(convos.values()), "me": uid})
+
+
+def _chat_param(query, i):
+    # accepts chat_users[0]/chat_users[1] (as in the URL) or user1/user2
+    v = query.get(f"chat_users[{i}]", query.get("user1" if i == 0 else "user2", [None]))
+    return v[0] if v and v[0] not in (None, "") else None
+
+
+def h_chat(self, conn, match, query):
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    u0, u1 = _chat_param(query, 0), _chat_param(query, 1)
+    if u0 is None or u1 is None:
+        return self.send_json(400, {"error": "chat_users[0] and chat_users[1] required"})
+    try:
+        u0, u1 = int(u0), int(u1)
+    except ValueError:
+        return self.send_json(400, {"error": "invalid chat users"})
+
+    if MODE == "secure":
+        # SECURE: you may only open a conversation you are part of (or admin).
+        me = load_user(conn, ident.get("sub"))
+        if not (me["role"] == "admin" or ident.get("sub") in (u0, u1)):
+            return self.send_json(403, {"error": "forbidden"})
+    # VULN (IDOR): no check that the caller is a participant. Changing
+    # chat_users[0]/chat_users[1] in the URL opens anyone's private conversation,
+    # including the professor <-> admin chat.
+
+    rows = db.run(conn,
+        "SELECT m.*, s.full_name AS sender_name, s.username AS sender_username "
+        "FROM messages m JOIN users s ON s.id = m.sender_id "
+        "WHERE (m.sender_id = ? AND m.recipient_id = ?) "
+        "   OR (m.sender_id = ? AND m.recipient_id = ?) ORDER BY m.id", (u0, u1, u1, u0))
+    msgs = [{
+        "id": m["id"], "sender_id": m["sender_id"], "sender_name": m["sender_name"],
+        "sender_username": m["sender_username"], "body": read_body(m),
+        "created_at": m["created_at"],
+    } for m in rows]
+    parts = db.run(conn, "SELECT id, full_name, username, role FROM users WHERE id IN (?, ?)",
+                   (u0, u1))
+    self.send_json(200, {"me": ident.get("sub"), "participants": parts, "messages": msgs})
+
+
+def h_chat_send(self, conn, match, query):
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    b = self.body_json()
+    to = b.get("to")
+    rec = db.run(conn, "SELECT id FROM users WHERE id = ? OR username = ?", (to, to))
+    if not rec:
+        return self.send_json(400, {"error": "unknown recipient"})
+    text = b.get("body") or ""
+    stored, enc = (cu.encrypt(text), 1) if MODE == "secure" else (text, 0)
+    conn.execute("INSERT INTO messages (sender_id, recipient_id, body, is_encrypted) "
+                 "VALUES (?,?,?,?)", (ident.get("sub"), rec[0]["id"], stored, enc))
+    conn.commit()
+    self.send_json(201, {"ok": True})
+
+
+# ==========================================================================
+# Admin
+# ==========================================================================
+def h_admin_users(self, conn, match, query):
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+
+    if MODE == "vuln":
+        # VULN: trusts the role claim from the (unverified) token, and leaks hashes.
+        if ident.get("role") != "admin":
+            return self.send_json(403, {"error": "admins only"})
+        users = db.run(conn, "SELECT * FROM users ORDER BY id")
+        return self.send_json(200, {"users": [public_user(u, True) for u in users]})
+    else:
+        # SECURE: re-check the role against the database; never return secrets.
+        me = load_user(conn, ident.get("sub"))
+        if not me or me["role"] != "admin":
+            return self.send_json(403, {"error": "admins only"})
+        users = db.run(conn, "SELECT * FROM users ORDER BY id")
+        return self.send_json(200, {"users": [public_user(u) for u in users]})
+
+
 ROUTES = [
-    ("GET",  re.compile(r"^/api/config$"),               h_config),
-    ("POST", re.compile(r"^/api/register$"),             h_register),
-    ("POST", re.compile(r"^/api/login$"),                h_login),
-    ("POST", re.compile(r"^/api/logout$"),               h_logout),
-    ("GET",  re.compile(r"^/api/me$"),                    h_me),
-    ("GET",  re.compile(r"^/api/users/(?P<id>\d+)$"),     h_get_user),
-    ("GET",  re.compile(r"^/api/admin/users$"),           h_admin_users),
-    ("GET",  re.compile(r"^/api/search$"),                h_search),
-    ("GET",  re.compile(r"^/api/notes$"),                 h_list_notes),
-    ("POST", re.compile(r"^/api/notes$"),                 h_create_note),
+    ("GET",  re.compile(r"^/api/config$"),              h_config),
+    ("GET",  re.compile(r"^/api/pubkey$"),              h_pubkey),
+    ("POST", re.compile(r"^/api/register$"),            h_register),
+    ("POST", re.compile(r"^/api/login$"),               h_login),
+    ("GET",  re.compile(r"^/api/me$"),                   h_me),
+    ("GET",  re.compile(r"^/api/courses$"),              h_courses),
+    ("GET",  re.compile(r"^/api/my/courses$"),           h_my_courses),
+    ("GET",  re.compile(r"^/api/my/grades$"),            h_my_grades),
+    ("GET",  re.compile(r"^/api/certifications$"),        h_certifications),
+    ("POST", re.compile(r"^/api/certifications$"),        h_issue_cert),
+    ("POST", re.compile(r"^/api/grades$"),               h_set_grade),
+    ("GET",  re.compile(r"^/api/messages/recent$"),      h_recent_messages),
+    ("GET",  re.compile(r"^/api/chats$"),                h_chats),
+    ("GET",  re.compile(r"^/api/chat$"),                 h_chat),
+    ("POST", re.compile(r"^/api/chat$"),                 h_chat_send),
+    ("GET",  re.compile(r"^/api/admin/users$"),          h_admin_users),
 ]
 
 
-# ==========================================================================
-# Entrypoint
-# ==========================================================================
 def main():
     db.init_db(MODE, reset=bool(os.environ.get("RESET_DB")))
-    banner = "VULNERABLE" if MODE == "vuln" else "SECURE (patched)"
-    print("=" * 64)
-    print(f"  Auth & Crypto Lab — mode: {MODE.upper()}  [{banner}]")
+    print("=" * 60)
+    print(f"  Campus Portal — Student Management System [{MODE.upper()}]")
     print(f"  http://{HOST}:{PORT}")
-    print(f"  DB: {db.db_path(MODE)}")
-    print("=" * 64)
+    print(f"  database: {db.db_path(MODE)}")
+    print("=" * 60)
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[app] shutting down")
+        print("\nshutting down")
         httpd.server_close()
 
 

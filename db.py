@@ -1,125 +1,185 @@
 """
-db.py — database access layer for the vulnerable auth lab.
+Database access for the Student Management System.
 
-Exposes two DELIBERATELY DIFFERENT query helpers so the SQL-injection lesson is
-honest:
+Two query helpers make the SQL-injection lesson concrete:
+    run_raw(conn, sql)          -> raw SQL built by concatenation (injectable)
+    run(conn, sql, params=())   -> parameterized query (values are bound)
 
-    vuln_query(conn, sql)            -> runs raw SQL you built by concatenation
-    safe_query(conn, sql, params)    -> runs a parameterized query (bound values)
-
-The security difference between them is real: `safe_query` sends the SQL text and
-the user data over separate channels, so user input can never change the meaning
-of the statement. `vuln_query` has no such separation.
-
-Each mode gets its own database file so the seeded password-hash scheme is
-consistent (MD5 in vuln mode, PBKDF2 in secure mode).
+Each build uses its own database file so the seeded password scheme, message
+encryption and certificate signatures stay consistent.
 """
 
 import os
 import sqlite3
-import secrets
 
 import auth
+import crypto_utils as cu
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_PATH = os.path.join(HERE, "schema.sql")
 
 
 def db_path(mode: str) -> str:
-    return os.path.join(HERE, f"lab_{mode}.db")
+    return os.path.join(HERE, f"sms_{mode}.db")
 
 
 def get_conn(mode: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path(mode))
-    conn.row_factory = sqlite3.Row  # rows behave like dicts
+    conn.row_factory = sqlite3.Row
     return conn
 
 
-# --------------------------------------------------------------------------
-# Query helpers
-# --------------------------------------------------------------------------
-def vuln_query(conn: sqlite3.Connection, sql: str):
-    """Execute raw SQL. Callers build `sql` by string concatenation -> injectable.
-
-    Uses executescript-free execute; note that sqlite3's execute() only runs the
-    FIRST statement, which is realistic for many drivers. Stacked-query payloads
-    that rely on a second `;` statement will not fire here, but UNION-based and
-    boolean/comment-based injection work fully — which is the common real case.
-    """
+def run_raw(conn, sql):
     cur = conn.execute(sql)
     try:
-        rows = cur.fetchall()
+        return [dict(r) for r in cur.fetchall()]
     except sqlite3.ProgrammingError:
-        rows = []
-    return [dict(r) for r in rows]
+        return []
 
 
-def safe_query(conn: sqlite3.Connection, sql: str, params=()):
-    """Execute a parameterized query. User data is bound, never concatenated."""
+def run(conn, sql, params=()):
     cur = conn.execute(sql, params)
     try:
-        rows = cur.fetchall()
+        return [dict(r) for r in cur.fetchall()]
     except sqlite3.ProgrammingError:
-        rows = []
-    return [dict(r) for r in rows]
+        return []
 
 
-# --------------------------------------------------------------------------
-# Initialization + seeding
-# --------------------------------------------------------------------------
-SEED_USERS = [
-    # username, email,               full_name,      role,    password
-    ("admin", "admin@lab.local", "Site Administrator", "admin", "admin123"),
-    ("alice", "alice@lab.local", "Alice Anderson",     "user",  "password1"),
-    ("bob",   "bob@lab.local",   "Bob Brown",          "user",  "hunter2"),
+# --- seed data -----------------------------------------------------------
+USERS = [
+    # username,     password,   role,        full_name,          email
+    ("admin",       "admin123", "admin",     "System Admin",     "admin@campus.edu"),
+    ("prof_smith",  "teach123", "professor", "Dr. John Smith",   "smith@campus.edu"),
+    ("prof_jones",  "teach456", "professor", "Dr. Emily Jones",  "jones@campus.edu"),
+    ("alice",       "password1","student",   "Alice Anderson",   "alice@campus.edu"),
+    ("bob",         "hunter2",  "student",   "Bob Brown",        "bob@campus.edu"),
+    ("carol",       "qwerty",   "student",   "Carol Clark",      "carol@campus.edu"),
 ]
 
-SEED_NOTES = [
-    ("admin", "Root recovery",   "Master recovery phrase: correct-horse-battery-staple"),
-    ("alice", "Diary",           "Note to self: reuse this password everywhere."),
-    ("bob",   "TODO",            "Ask admin for a raise."),
+COURSES = [
+    # code,   name,          professor
+    ("MATH",  "Mathematics",       "prof_jones"),
+    ("PHYS",  "Physics",           "prof_jones"),
+    ("PROG",  "Programming",       "prof_smith"),
+    ("DB",    "Databases",         "prof_smith"),
+    ("ALGO",  "Algorithms",        "prof_smith"),
+    ("NET",   "Computer Networks", "prof_jones"),
+]
+
+ENROLLMENTS = [
+    ("alice", "MATH"), ("alice", "PHYS"), ("alice", "PROG"),
+    ("alice", "DB"),   ("alice", "ALGO"), ("alice", "NET"),
+    ("bob",   "MATH"), ("bob",   "PHYS"), ("bob",   "PROG"), ("bob", "DB"),
+    ("carol", "PROG"), ("carol", "DB"),   ("carol", "ALGO"), ("carol", "NET"),
+]
+
+# Grades on the /20 scale (Tunisian system).
+GRADES = [
+    ("alice", "MATH", "14.00"), ("alice", "PHYS", "12.50"), ("alice", "PROG", "16.00"),
+    ("alice", "DB",   "15.00"), ("alice", "ALGO", "11.00"), ("alice", "NET",  "13.50"),
+    ("bob",   "MATH", "9.00"),  ("bob",   "PHYS", "11.00"), ("bob",   "PROG", "13.00"),
+    ("bob",   "DB",   "10.50"),
+    ("carol", "PROG", "17.00"), ("carol", "DB",   "14.50"), ("carol", "ALGO", "12.00"),
+    ("carol", "NET",  "15.00"),
+]
+
+CERTS = [
+    # student, title,               grade, issued_date
+    ("alice", "Python Developer",   "A",   "2026-06-15"),
+    ("alice", "Database Design",    "B+",  "2026-07-01"),
+    ("bob",   "Data Analyst",       "A-",  "2026-06-20"),
+]
+
+# Chat messages: (sender, recipient, body). Inserted in order.
+CHATS = [
+    ("alice", "bob", "Hey Bob, are you coming to the study group?"),
+    ("bob", "alice", "Yes! Library at 6pm?"),
+    ("alice", "bob", "Perfect, see you then."),
+
+    ("prof_smith", "alice", "Alice, please review chapter 5 before the next lab."),
+    ("alice", "prof_smith", "Thank you professor, I will."),
+
+    ("carol", "prof_jones", "Professor, will the physics exam cover chapter 8?"),
+    ("prof_jones", "carol", "Yes, chapters 6 through 8."),
+
+    # Private professor <-> admin conversation containing a secret.
+    ("prof_smith", "admin", "The students keep asking me about the final exam portal."),
+    ("admin", "prof_smith", "Do not share it with anyone. The grading portal master "
+                            "password is Adm1n_Gu@rd14n_2026 — keep this strictly between us."),
+    ("prof_smith", "admin", "Understood, sir. I'll keep it confidential."),
+
+    ("admin", "prof_jones", "Next term budget approved: 250,000 DT. Strictly confidential."),
 ]
 
 
-def init_db(mode: str, reset: bool = False) -> None:
+def init_db(mode, reset=False):
+    cu.ensure_keys()
     path = db_path(mode)
     if reset and os.path.exists(path):
         os.remove(path)
     fresh = not os.path.exists(path)
 
     conn = get_conn(mode)
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+    with open(SCHEMA_PATH) as f:
         conn.executescript(f.read())
-
     if fresh:
         _seed(conn, mode)
     conn.commit()
     conn.close()
 
 
-def _seed(conn: sqlite3.Connection, mode: str) -> None:
-    name_to_id = {}
-    for username, email, full_name, role, password in SEED_USERS:
-        pwd_hash, salt, scheme = auth.hash_password(password, mode)
-        api_key = "sk_live_" + secrets.token_hex(16)
+def _seed(conn, mode):
+    uid = {}
+    for username, pwd, role, full_name, email in USERS:
+        h, salt, scheme = auth.hash_password(pwd, mode)
         cur = conn.execute(
-            "INSERT INTO users (username, email, full_name, password_hash, salt, "
-            "hash_scheme, role, api_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (username, email, full_name, pwd_hash, salt, scheme, role, api_key),
-        )
-        name_to_id[username] = cur.lastrowid
+            "INSERT INTO users (username, password_hash, salt, hash_scheme, role, "
+            "full_name, email) VALUES (?,?,?,?,?,?,?)",
+            (username, h, salt, scheme, role, full_name, email))
+        uid[username] = cur.lastrowid
 
-    for username, title, body in SEED_NOTES:
+    cid = {}
+    for code, name, prof in COURSES:
+        cur = conn.execute(
+            "INSERT INTO courses (code, name, professor_id) VALUES (?,?,?)",
+            (code, name, uid[prof]))
+        cid[code] = cur.lastrowid
+
+    for student, code in ENROLLMENTS:
+        conn.execute("INSERT INTO enrollments (course_id, student_id) VALUES (?,?)",
+                     (cid[code], uid[student]))
+
+    for student, code, grade in GRADES:
         conn.execute(
-            "INSERT INTO notes (user_id, title, body) VALUES (?, ?, ?)",
-            (name_to_id[username], title, body),
-        )
+            "INSERT INTO grades (course_id, student_id, grade, updated_by) VALUES (?,?,?,?)",
+            (cid[code], uid[student], grade, uid["prof_smith"]))
+
+    for student, title, grade, date in CERTS:
+        # SECURE: issuer signs the certificate. VULN mode leaves it unsigned,
+        # so a forged certificate cannot be told apart from a real one.
+        sig = cu.sign_cert(uid[student], title, grade, date) if mode == "secure" else None
+        conn.execute(
+            "INSERT INTO certifications (student_id, title, grade, issued_date, signature) "
+            "VALUES (?,?,?,?,?)", (uid[student], title, grade, date, sig))
+
+    for i, (sender, recipient, body) in enumerate(CHATS):
+        # SECURE: encrypt the body at rest. VULN mode stores plaintext, so anyone
+        # who can read the DB file reads every private message.
+        if mode == "secure":
+            stored, enc = cu.encrypt(body), 1
+        else:
+            stored, enc = body, 0
+        # spread timestamps a little so ordering is stable
+        conn.execute(
+            "INSERT INTO messages (sender_id, recipient_id, body, is_encrypted, created_at) "
+            "VALUES (?,?,?,?, datetime('now', ?))",
+            (uid[sender], uid[recipient], stored, enc, f"-{len(CHATS) - i} minutes"))
+
     conn.commit()
 
 
 if __name__ == "__main__":
     import sys
-
-    mode = sys.argv[1] if len(sys.argv) > 1 else "vuln"
-    init_db(mode, reset=True)
-    print(f"[db] initialized fresh '{mode}' database at {db_path(mode)}")
+    m = sys.argv[1] if len(sys.argv) > 1 else "vuln"
+    init_db(m, reset=True)
+    print(f"initialized {m} database at {db_path(m)}")

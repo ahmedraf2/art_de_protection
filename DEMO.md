@@ -200,14 +200,18 @@ API. You need both.
 Open **Blockchain** in the sidebar on `$S`. The banner shows the `GradeLedger`
 contract address and the **issuer** — the only key allowed to write. Below it, the
 grade-integrity table (every row **✔ matches**) and the anchored events, each with
-its sender and transaction hash. On `$V` the page says there is no ledger at all.
+its sender and transaction hash. The vuln build has no Blockchain page at all.
+
+**Quickest version:** `python3 scripts/try_attack.py` plays the attacker against both
+builds and prints a side-by-side result (reset afterwards with
+`docker compose restart vuln secure`). The steps below do the same by hand.
 
 **Break (vuln build, `$V`):** change a grade straight in the database — the app has
 no way to notice:
 
 ```bash
 sqlite3 sms_vuln.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
-curl -s $V/api/grades/integrity -H "Authorization: Bearer $TOK"   # {"enforced": false}
+curl -s $V/api/my/grades -H "Authorization: Bearer $TOK"   # Mathematics 20.00, no alarm anywhere
 ```
 
 **Fix 1 — DB tampering is detected (`$S`).** Same edit on the secure DB, then reload

@@ -331,7 +331,8 @@ without question and offers no way to tell it was altered:
 
 ```bash
 sqlite3 sms_vuln.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
-# /api/grades/integrity -> {"enforced": false}  (no check at all)
+# /api/my/grades now shows 20.00; the build has no ledger and no integrity check
+# (/api/grades/integrity and /api/blockchain return 404)
 ```
 
 **Impact:** silent, unattributable tampering with grades and certificates — the
@@ -366,8 +367,9 @@ the issuer can write, and verify on read.
 
   A write from any other account reverts with `NotIssuer()` (see DEMO §8).
 
-**Verify:** on the vuln build `GET /api/grades/integrity` returns
-`{"enforced": false}` and certificates carry no `on_chain` field; on the secure
+**Verify:** `python3 scripts/try_attack.py` runs the same attacks against both
+builds and prints the result side by side. By hand: the vuln build has no
+integrity endpoint (404) and certificates carry no `on_chain` field; on the secure
 build grades show `ok:true` until the DB is edited, and `cd contracts && forge test`
 shows a non-issuer write reverting.
 

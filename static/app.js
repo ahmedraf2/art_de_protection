@@ -5,6 +5,7 @@
 // editable in the address bar.
 
 let USER = null;
+let MODE = "vuln";      // build reported by /api/config ("vuln" | "secure")
 
 function token() { return localStorage.getItem("token") || ""; }
 function setToken(t) { localStorage.setItem("token", t); }
@@ -59,7 +60,7 @@ const NAV = [
   { view: "chat", label: "Chat", icon: "💬", roles: ["student", "professor", "admin"] },
   { view: "courses", label: "Courses", icon: "📚", roles: ["student", "professor", "admin"] },
   { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student", "professor", "admin"] },
-  { view: "blockchain", label: "Blockchain", icon: "⛓️", roles: ["student", "professor", "admin"] },
+  { view: "blockchain", label: "Blockchain", icon: "⛓️", roles: ["student", "professor", "admin"], secureOnly: true },
   { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor", "admin"] },
   { view: "admin", label: "Admin", icon: "⚙️", roles: ["admin"] },
 ];
@@ -68,13 +69,15 @@ async function enterApp() {
   const { status, data } = await api("GET", "/api/me");
   if (status !== 200) { showLogin(); return; }
   USER = data.user;
+  MODE = (await get("/api/config")).mode || "vuln";
   $("login-screen").classList.add("hidden");
   $("register-screen").classList.add("hidden");
   $("app").classList.remove("hidden");
   $("tb-name").textContent = USER.full_name;
   $("avatar").textContent = initials(USER.full_name);
 
-  $("sidebar").innerHTML = NAV.filter(n => n.roles.includes(USER.role))
+  // the vuln build has no integrity ledger, so it has no Blockchain page
+  $("sidebar").innerHTML = NAV.filter(n => n.roles.includes(USER.role) && !(n.secureOnly && MODE !== "secure"))
     .map(n => `<button data-view="${n.view}" onclick="nav('${n.view}')"><span>${n.icon}</span> ${n.label}</button>`).join("");
 
   if (!location.hash) location.hash = "dashboard";
@@ -186,8 +189,8 @@ VIEWS.courses = async function () {
 VIEWS.certifications = async function (params) {
   const sid = params.get("student_id");
   const d = await get("/api/certifications" + (sid ? "?student_id=" + encodeURIComponent(sid) : ""));
+  const ledger = MODE === "secure";      // the Ledger column only exists in the secure build
   const ledgerCell = (c) => {
-    if (c.on_chain === undefined) return `<span class="muted">—</span>`;
     if (c.on_chain === null) return `<span class="pill o">&#9888; unavailable</span>`;
     return c.on_chain ? `<span class="pill g">&#9939; on&#8209;chain</span>`
                       : `<span class="pill b">&#9888; not on chain</span>`;
@@ -196,11 +199,11 @@ VIEWS.certifications = async function (params) {
     <tr><td>${esc(c.full_name || "")}</td><td>${esc(c.title)}</td><td>${esc(c.grade)}</td>
     <td>${esc(c.issued_date)}</td>
     <td>${c.verified ? `<span class="pill g">&#10004; valid</span>` : `<span class="pill b">&#10008; invalid</span>`}</td>
-    <td>${ledgerCell(c)}</td></tr>`).join("");
+    ${ledger ? `<td>${ledgerCell(c)}</td>` : ""}</tr>`).join("");
   $("content").innerHTML = `
     <div class="page-title">Certifications</div>
     <p class="page-sub">Your issued certifications, verified against the campus signing key and integrity ledger.</p>
-    <div class="card"><table><thead><tr><th>Student</th><th>Title</th><th>Grade</th><th>Issued</th><th>Signature</th><th>Ledger</th></tr></thead>
+    <div class="card"><table><thead><tr><th>Student</th><th>Title</th><th>Grade</th><th>Issued</th><th>Signature</th>${ledger ? "<th>Ledger</th>" : ""}</tr></thead>
     <tbody>${rows || `<tr><td colspan="6" class="muted">No certifications.</td></tr>`}</tbody></table></div>`;
 };
 
@@ -210,31 +213,23 @@ function shortHash(h) { return h ? h.slice(0, 10) + "…" + h.slice(-6) : ""; }
 VIEWS.blockchain = async function () {
   const [chain, integ] = await Promise.all([get("/api/blockchain"), get("/api/grades/integrity")]);
   let banner;
-  if (!chain.enabled)
-    banner = `<div class="chain-banner bad">&#9888; No integrity ledger in this build — records are trusted blindly.</div>`;
-  else if (!chain.available)
+  if (!chain.available)
     banner = `<div class="chain-banner bad">&#9888; Ledger unavailable — ${esc(chain.error)}</div>`;
   else
     banner = `<div class="chain-banner ok">&#9939; Connected to GradeLedger (chain ${chain.chain_id}, block ${chain.block_number}).
       <div class="hashline"><span class="k">contract</span><code>${esc(chain.contract)}</code></div>
       <div class="hashline"><span class="k">issuer</span><code>${esc(chain.issuer)}</code> <span class="muted">— the only key allowed to write</span></div></div>`;
 
-  let integrityCard;
-  if (integ.enforced) {
-    const rows = (integ.rows || []).map(r => `
+  const rows = (integ.rows || []).map(r => `
       <tr><td>${esc(r.name)}</td><td>${gradePill(r.db_grade)}</td>
       <td><code>${shortHash(r.db_hash)}</code></td>
       <td>${r.chain_hash ? `<code>${shortHash(r.chain_hash)}</code>` : `<span class="muted">not anchored</span>`}</td>
       <td>${r.ok ? `<span class="pill g">&#10004; matches</span>` : `<span class="pill b">&#10008; TAMPERED</span>`}</td></tr>`).join("");
-    integrityCard = `<div class="card mt"><h3>Grade integrity check</h3>
+  const integrityCard = `<div class="card mt"><h3>Grade integrity check</h3>
       <p class="muted">The hash of each grade in the database is compared against the hash the issuer anchored in the contract.</p>
       ${integ.available ? `<table><thead><tr><th>Subject</th><th>Database</th><th>DB hash</th><th>Contract hash</th><th>Status</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="5" class="muted">No grades to check.</td></tr>`}</tbody></table>`
       : `<p class="pill o">&#9888; unavailable — cannot verify grades right now</p>`}</div>`;
-  } else {
-    integrityCard = `<div class="card mt"><h3>Grade integrity check</h3>
-      <p class="pill b">&#9888; Disabled in this build — the application never cross-checks grades against a ledger, so a tampered grade is accepted.</p></div>`;
-  }
 
   const events = (chain.events || []).slice().reverse().map(e => `
     <div class="block ${esc(e.type)}">
@@ -253,8 +248,8 @@ VIEWS.blockchain = async function () {
     <p class="page-sub">Grade and certificate hashes anchored in a smart contract on a local Ethereum node. Build: <b>${esc(chain.mode)}</b>.</p>
     ${banner}
     ${integrityCard}
-    ${chain.enabled ? `<div class="card mt"><h3>Anchored events (${(chain.events || []).length}, newest first)</h3>
-      <div class="chain">${events || `<p class="muted">No events.</p>`}</div></div>` : ""}`;
+    <div class="card mt"><h3>Anchored events (${(chain.events || []).length}, newest first)</h3>
+      <div class="chain">${events || `<p class="muted">No events.</p>`}</div></div>`;
 };
 
 // ---- chat ----

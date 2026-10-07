@@ -493,24 +493,24 @@ def h_admin_users():
 def h_blockchain():
     """Contract address, issuer and every anchored event (any user)."""
     if MODE == "vuln":
-        # VULN: this build keeps no integrity ledger at all.
-        return jsonify({"mode": MODE, "enabled": False, "events": []})
+        # VULN: this build has no integrity ledger, so nothing ever checks the
+        # grades/certifications tables for tampering (vulnerability #9).
+        return jsonify({"error": "no integrity ledger in this build"}), 404
     try:
-        return jsonify({"mode": MODE, "enabled": True, "available": True, **eth_ledger.info()})
+        return jsonify({"mode": MODE, "available": True, **eth_ledger.info()})
     except eth_ledger.LedgerUnavailable as e:
-        return jsonify({"mode": MODE, "enabled": True, "available": False,
-                        "error": str(e), "events": []}), 503
+        return jsonify({"mode": MODE, "available": False, "error": str(e), "events": []}), 503
 
 
 @app.get("/api/grades/integrity")
 @require_auth
 def h_grade_integrity():
     """Compare the caller's grades in the DB against the contract (tamper check)."""
-    conn = get_db()
     if MODE == "vuln":
-        # VULN: the app never cross-checks the grades table against a ledger,
-        # so a tampered grade is accepted at face value.
-        return jsonify({"enforced": False, "rows": []})
+        # VULN: this build has no integrity ledger, so nothing ever checks the
+        # grades/certifications tables for tampering (vulnerability #9).
+        return jsonify({"error": "no integrity ledger in this build"}), 404
+    conn = get_db()
     # SECURE: recompute each grade's hash from the DB and compare it with the
     # hash the issuer anchored in the contract. Any direct DB edit -> mismatch.
     uid = g.ident.get("sub")
@@ -526,8 +526,8 @@ def h_grade_integrity():
                          "db_hash": db_hash, "chain_hash": chain_hash,
                          "ok": db_hash == chain_hash})
     except eth_ledger.LedgerUnavailable as e:
-        return jsonify({"enforced": True, "available": False, "error": str(e), "rows": []}), 503
-    return jsonify({"enforced": True, "available": True, "rows": rows})
+        return jsonify({"available": False, "error": str(e), "rows": []}), 503
+    return jsonify({"available": True, "rows": rows})
 
 
 def main():

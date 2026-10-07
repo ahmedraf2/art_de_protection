@@ -52,7 +52,11 @@ cd contracts && forge build && forge test      # compile + run the 3 tests
 ```bash
 docker compose up --build        # anvil + contract build + secure (:3001) + vuln (:3000)
 docker compose down              # stop and remove the containers
+
+python3 scripts/try_attack.py    # play the attacker against both builds (see DEMO.md §8)
 ```
+
+Only the secure build uses the blockchain; the vuln build starts without anvil.
 
 Every service listens on `127.0.0.1` only (`network_mode: host`, Linux). The DB
 files and `keys/` are created in this folder, so `sqlite3`, `cast` and the browser
@@ -122,6 +126,8 @@ auth.py           JWT (HMAC-SHA256) + password hashing
 crypto_utils.py   AES-GCM encryption + Ed25519 certificate signatures
 eth_ledger.py     web3 client for the GradeLedger contract (anchor + verify)
 contracts/        Foundry project: src/GradeLedger.sol + test/
+scripts/          try_attack.py — tamper demo, vuln vs secure side by side
+docker-compose.yml, Dockerfile   one-command lab (keys, anvil, forge, secure, vuln)
 db.py             database access + seed data
 schema.sql        database schema
 static/           front-end (index.html, app.js, style.css)

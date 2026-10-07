@@ -3,10 +3,11 @@
 #     docker compose up --build        # start (Ctrl+C to stop)
 #     docker compose down              # remove the containers
 #
-#   anvil   local Ethereum node          127.0.0.1:8545
-#   forge   compiles GradeLedger.sol, then exits
+#   keys    creates the shared AES/Ed25519 keys once, then exits
+#   anvil   local Ethereum node          127.0.0.1:8545   (secure build only)
+#   forge   compiles GradeLedger.sol, then exits         (secure build only)
 #   secure  secure build                 http://127.0.0.1:3001
-#   vuln    vulnerable build             http://127.0.0.1:3000
+#   vuln    vulnerable build             http://127.0.0.1:3000  (no blockchain)
 #
 # network_mode: host -> every service listens on your machine's 127.0.0.1, exactly
 # as when run by hand. Nothing is reachable from the network, the app's
@@ -29,6 +30,12 @@ x-app: &app
     - ./:/app
 
 services:
+  # Both apps share keys/. Creating them here first means the two apps never
+  # race to generate them at the same time on a brand-new checkout.
+  keys:
+    <<: *app
+    command: ["python3", "-c", "import crypto_utils; crypto_utils.ensure_keys()"]
+
   anvil:
     image: ghcr.io/foundry-rs/foundry:latest
     network_mode: host
@@ -54,6 +61,8 @@ services:
       PORT: "3001"
       RESET_DB: "1"
     depends_on:
+      keys:
+        condition: service_completed_successfully
       anvil:
         condition: service_healthy
         restart: true            # `docker compose restart anvil` also restarts this app
@@ -72,7 +81,5 @@ services:
       PORT: "3000"
       RESET_DB: "1"
     depends_on:
-      # Start after the secure app: on the very first run both would otherwise
-      # create the shared keys in keys/ at the same time.
-      secure:
-        condition: service_healthy
+      keys:
+        condition: service_completed_successfully

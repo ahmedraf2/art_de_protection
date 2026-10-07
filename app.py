@@ -20,7 +20,7 @@ from flask import Flask, request, jsonify, g, send_from_directory
 import auth
 import db
 import crypto_utils as cu
-import blockchain
+import eth_ledger
 
 MODE = os.environ.get("APP_MODE", "vuln").lower()
 if MODE not in ("vuln", "secure"):
@@ -245,6 +245,7 @@ def h_certifications():
             "SELECT c.*, u.full_name FROM certifications c "
             "JOIN users u ON u.id = c.student_id WHERE c.student_id = ?", (student_id,))
 
+    chain_down = False
     for c in rows:
         if MODE == "vuln":
             # VULN: signatures are never checked and the ledger is never consulted,
@@ -253,9 +254,15 @@ def h_certifications():
         else:
             c["verified"] = cu.verify_cert(c["student_id"], c["title"], c["grade"],
                                            c["issued_date"], c.get("signature"))
-            # SECURE: also confirm the certificate is anchored on the ledger.
+            # SECURE: also confirm the certificate is anchored in the contract.
+            # If the node is down we can't tell: report null ("unavailable").
             fp = cu.cert_fingerprint(c["student_id"], c["title"], c["grade"], c["issued_date"])
-            c["on_chain"] = bool(blockchain.find(conn, type="certification", fingerprint=fp))
+            c["on_chain"] = None
+            if not chain_down:
+                try:
+                    c["on_chain"] = eth_ledger.is_cert_anchored(fp)
+                except eth_ledger.LedgerUnavailable:
+                    chain_down = True
     return jsonify({"certifications": rows})
 
 
@@ -276,18 +283,22 @@ def h_issue_cert():
     grade, issued = b.get("grade"), b.get("issued_date")
     # SECURE: sign the certificate so it can be verified later. VULN: unsigned.
     sig = cu.sign_cert(student_id, title, grade, issued) if MODE == "secure" else None
-    conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
-                 "signature) VALUES (?,?,?,?,?)", (student_id, title, grade, issued, sig))
-    conn.commit()
+    cur = conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
+                       "signature) VALUES (?,?,?,?,?)", (student_id, title, grade, issued, sig))
 
     if MODE == "secure":
-        # SECURE: anchor the certificate's fingerprint so anyone can later check
-        # that it was really issued here (a forged cert will be "not on chain").
-        blockchain.add_block(conn, {
-            "type": "certification", "student_id": student_id, "title": title,
-            "grade": grade, "issued_date": issued,
-            "fingerprint": cu.cert_fingerprint(student_id, title, grade, issued)})
+        # SECURE: anchor the certificate's fingerprint (computed from the row as
+        # stored) so a forged cert will later show as "not on chain". The DB
+        # insert is committed only if the contract accepted the anchor.
+        c = db.run(conn, "SELECT * FROM certifications WHERE id = ?", (cur.lastrowid,))[0]
+        try:
+            eth_ledger.anchor_cert(cu.cert_fingerprint(c["student_id"], c["title"],
+                                                       c["grade"], c["issued_date"]))
+        except eth_ledger.LedgerUnavailable as e:
+            conn.rollback()
+            return jsonify({"error": f"integrity ledger unavailable: {e}"}), 503
     # VULN: the certificate is neither signed nor anchored.
+    conn.commit()
     return jsonify({"ok": True}), 201
 
 
@@ -318,16 +329,23 @@ def h_set_grade():
     else:
         conn.execute("INSERT INTO grades (course_id, student_id, grade, updated_by) "
                      "VALUES (?,?,?,?)", (course_id, student_id, grade, g.ident.get("sub")))
-    conn.commit()
 
     if MODE == "secure":
-        # SECURE: anchor every legitimate grade change on the integrity ledger,
-        # so a later direct edit to the grades table shows up as DB != chain.
-        blockchain.add_block(conn, {"type": "grade", "course_id": course_id,
-                                    "student_id": student_id, "grade": grade,
-                                    "by": g.ident.get("sub")})
+        # SECURE: anchor the hash of every legitimate grade change in the contract,
+        # so a later direct edit to the grades table shows up as DB != ledger.
+        # The hash is computed from the row as stored, and the DB change is
+        # committed only if the transaction succeeded.
+        row = db.run(conn, "SELECT course_id, student_id, grade FROM grades "
+                           "WHERE course_id = ? AND student_id = ?", (course_id, student_id))[0]
+        try:
+            eth_ledger.anchor_grade(row["course_id"], row["student_id"],
+                                    eth_ledger.grade_hash(**row))
+        except eth_ledger.LedgerUnavailable as e:
+            conn.rollback()
+            return jsonify({"error": f"integrity ledger unavailable: {e}"}), 503
     # VULN: nothing is anchored and nothing is verified, so tampering with the
     # grades table afterwards goes completely unnoticed.
+    conn.commit()
     return jsonify({"ok": True})
 
 
@@ -468,57 +486,48 @@ def h_admin_users():
 
 
 # ==========================================================================
-# Integrity ledger (blockchain)
+# Integrity ledger (GradeLedger smart contract on a local anvil node)
 # ==========================================================================
-def _block_summary(b):
-    d = b.get("data") or {}
-    t = d.get("type")
-    if t == "genesis":
-        return "Genesis block"
-    if t == "grade":
-        return f"Grade · course {d.get('course_id')} · student {d.get('student_id')} = {d.get('grade')}/20"
-    if t == "certification":
-        return f"Certification · \"{d.get('title')}\" → student {d.get('student_id')}"
-    return t or "record"
-
-
 @app.get("/api/blockchain")
 @require_auth
 def h_blockchain():
-    """The integrity ledger and its live verification result (any user)."""
-    conn = get_db()
-    ok, problems = blockchain.verify_chain(conn)
-    out = [{
-        "idx": b["idx"], "timestamp": b["timestamp"],
-        "type": (b["data"] or {}).get("type"), "summary": _block_summary(b),
-        "data": b["data"], "prev_hash": b["prev_hash"],
-        "hash": b["hash"], "nonce": b["nonce"],
-    } for b in blockchain.blocks(conn)]
-    return jsonify({"mode": MODE, "height": len(out),
-                    "valid": ok, "problems": problems, "blocks": out})
+    """Contract address, issuer and every anchored event (any user)."""
+    if MODE == "vuln":
+        # VULN: this build keeps no integrity ledger at all.
+        return jsonify({"mode": MODE, "enabled": False, "events": []})
+    try:
+        return jsonify({"mode": MODE, "enabled": True, "available": True, **eth_ledger.info()})
+    except eth_ledger.LedgerUnavailable as e:
+        return jsonify({"mode": MODE, "enabled": True, "available": False,
+                        "error": str(e), "events": []}), 503
 
 
 @app.get("/api/grades/integrity")
 @require_auth
 def h_grade_integrity():
-    """Compare the caller's grades in the DB against the ledger (tamper check)."""
+    """Compare the caller's grades in the DB against the contract (tamper check)."""
     conn = get_db()
     if MODE == "vuln":
-        # VULN: the app never cross-checks the grades table against the ledger,
+        # VULN: the app never cross-checks the grades table against a ledger,
         # so a tampered grade is accepted at face value.
         return jsonify({"enforced": False, "rows": []})
+    # SECURE: recompute each grade's hash from the DB and compare it with the
+    # hash the issuer anchored in the contract. Any direct DB edit -> mismatch.
     uid = g.ident.get("sub")
     grades = db.run(conn,
-        "SELECT g.course_id, g.grade, c.code, c.name FROM grades g "
+        "SELECT g.course_id, g.student_id, g.grade, c.code, c.name FROM grades g "
         "JOIN courses c ON c.id = g.course_id WHERE g.student_id = ? ORDER BY c.name", (uid,))
-    ok, _ = blockchain.verify_chain(conn)
     rows = []
-    for gr in grades:
-        anchored = blockchain.find(conn, type="grade", student_id=uid, course_id=gr["course_id"])
-        ledger_grade = anchored[-1]["data"].get("grade") if anchored else None
-        rows.append({"code": gr["code"], "name": gr["name"], "db_grade": gr["grade"],
-                     "ledger_grade": ledger_grade, "ok": ledger_grade == gr["grade"]})
-    return jsonify({"enforced": True, "chain_valid": ok, "rows": rows})
+    try:
+        for gr in grades:
+            db_hash = eth_ledger.grade_hash(gr["course_id"], gr["student_id"], gr["grade"])
+            chain_hash = eth_ledger.get_grade(gr["course_id"], gr["student_id"])
+            rows.append({"code": gr["code"], "name": gr["name"], "db_grade": gr["grade"],
+                         "db_hash": db_hash, "chain_hash": chain_hash,
+                         "ok": db_hash == chain_hash})
+    except eth_ledger.LedgerUnavailable as e:
+        return jsonify({"enforced": True, "available": False, "error": str(e), "rows": []}), 503
+    return jsonify({"enforced": True, "available": True, "rows": rows})
 
 
 def main():
@@ -527,6 +536,14 @@ def main():
     print(f"  Campus Portal — Student Management System [{MODE.upper()}]")
     print(f"  http://{HOST}:{PORT}")
     print(f"  database: {db.db_path(MODE)}")
+    if MODE == "secure":
+        problem = eth_ledger.check_deployment()
+        if problem:
+            print(f"  !! integrity ledger: {problem}")
+            print("  !! start anvil, then restart with RESET_DB=1 to redeploy + re-anchor.")
+            print("  !! until then, grade/cert writes return 503.")
+        else:
+            print(f"  ledger:   GradeLedger at {eth_ledger.deployment()['address']}")
     print("=" * 60)
     # threaded so concurrent requests behave like the previous server; the Flask
     # dev server is fine for this local lab (not for production).

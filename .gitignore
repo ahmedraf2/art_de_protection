@@ -6,3 +6,6 @@ sms_secure.db
 keys/
 __pycache__/
 *.pyc
+# foundry build output
+contracts/out/
+contracts/cache/

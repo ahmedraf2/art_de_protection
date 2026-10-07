@@ -188,6 +188,7 @@ VIEWS.certifications = async function (params) {
   const d = await get("/api/certifications" + (sid ? "?student_id=" + encodeURIComponent(sid) : ""));
   const ledgerCell = (c) => {
     if (c.on_chain === undefined) return `<span class="muted">—</span>`;
+    if (c.on_chain === null) return `<span class="pill o">&#9888; unavailable</span>`;
     return c.on_chain ? `<span class="pill g">&#9939; on&#8209;chain</span>`
                       : `<span class="pill b">&#9888; not on chain</span>`;
   };
@@ -208,42 +209,52 @@ function shortHash(h) { return h ? h.slice(0, 10) + "…" + h.slice(-6) : ""; }
 
 VIEWS.blockchain = async function () {
   const [chain, integ] = await Promise.all([get("/api/blockchain"), get("/api/grades/integrity")]);
-  const banner = chain.valid
-    ? `<div class="chain-banner ok">&#9939; Ledger intact — ${chain.height} blocks verified (SHA-256 links + proof-of-work).</div>`
-    : `<div class="chain-banner bad">&#9888; Ledger BROKEN — ${(chain.problems || []).map(p => `block ${p.idx}: ${esc(p.error)}`).join("; ")}</div>`;
+  let banner;
+  if (!chain.enabled)
+    banner = `<div class="chain-banner bad">&#9888; No integrity ledger in this build — records are trusted blindly.</div>`;
+  else if (!chain.available)
+    banner = `<div class="chain-banner bad">&#9888; Ledger unavailable — ${esc(chain.error)}</div>`;
+  else
+    banner = `<div class="chain-banner ok">&#9939; Connected to GradeLedger (chain ${chain.chain_id}, block ${chain.block_number}).
+      <div class="hashline"><span class="k">contract</span><code>${esc(chain.contract)}</code></div>
+      <div class="hashline"><span class="k">issuer</span><code>${esc(chain.issuer)}</code> <span class="muted">— the only key allowed to write</span></div></div>`;
 
   let integrityCard;
   if (integ.enforced) {
     const rows = (integ.rows || []).map(r => `
       <tr><td>${esc(r.name)}</td><td>${gradePill(r.db_grade)}</td>
-      <td>${r.ledger_grade == null ? `<span class="muted">—</span>` : gradePill(r.ledger_grade)}</td>
+      <td><code>${shortHash(r.db_hash)}</code></td>
+      <td>${r.chain_hash ? `<code>${shortHash(r.chain_hash)}</code>` : `<span class="muted">not anchored</span>`}</td>
       <td>${r.ok ? `<span class="pill g">&#10004; matches</span>` : `<span class="pill b">&#10008; TAMPERED</span>`}</td></tr>`).join("");
     integrityCard = `<div class="card mt"><h3>Grade integrity check</h3>
-      <p class="muted">Every grade in the database is compared against the value anchored on the ledger.</p>
-      <table><thead><tr><th>Subject</th><th>Database</th><th>Ledger</th><th>Status</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="4" class="muted">No grades to check.</td></tr>`}</tbody></table></div>`;
+      <p class="muted">The hash of each grade in the database is compared against the hash the issuer anchored in the contract.</p>
+      ${integ.available ? `<table><thead><tr><th>Subject</th><th>Database</th><th>DB hash</th><th>Contract hash</th><th>Status</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="5" class="muted">No grades to check.</td></tr>`}</tbody></table>`
+      : `<p class="pill o">&#9888; unavailable — cannot verify grades right now</p>`}</div>`;
   } else {
     integrityCard = `<div class="card mt"><h3>Grade integrity check</h3>
-      <p class="pill b">&#9888; Disabled in this build — the application never cross-checks grades against the ledger, so a tampered grade is accepted.</p></div>`;
+      <p class="pill b">&#9888; Disabled in this build — the application never cross-checks grades against a ledger, so a tampered grade is accepted.</p></div>`;
   }
 
-  const blocks = (chain.blocks || []).map(b => `
-    <div class="block ${esc(b.type || "")}">
-      <div class="block-top"><span class="block-idx">#${b.idx}</span>
-        <span class="block-type">${esc(b.type || "record")}</span>
-        <span class="muted">${esc(fmtDate(b.timestamp))}</span></div>
-      <div class="block-sum">${esc(b.summary)}</div>
-      <div class="hashline"><span class="k">prev</span><code>${shortHash(b.prev_hash)}</code></div>
-      <div class="hashline"><span class="k">hash</span><code>${shortHash(b.hash)}</code><span class="muted">nonce ${b.nonce}</span></div>
+  const events = (chain.events || []).slice().reverse().map(e => `
+    <div class="block ${esc(e.type)}">
+      <div class="block-top"><span class="block-idx">block ${e.block}</span>
+        <span class="block-type">${esc(e.type)}</span>
+        <span class="muted">${esc(fmtDate(new Date(e.timestamp * 1000).toISOString()))}</span></div>
+      <div class="block-sum">${e.type === "grade"
+        ? `Grade · course ${e.course_id} · student ${e.student_id}` : `Certification fingerprint`}</div>
+      <div class="hashline"><span class="k">hash</span><code>${shortHash(e.hash)}</code></div>
+      <div class="hashline"><span class="k">sender</span><code>${esc(e.sender)}</code></div>
+      <div class="hashline"><span class="k">tx</span><code>${shortHash(e.tx_hash)}</code></div>
     </div>`).join("");
 
   $("content").innerHTML = `
     <div class="page-title">Integrity ledger</div>
-    <p class="page-sub">A tamper-evident blockchain anchoring grades and certifications. Build: <b>${esc(chain.mode)}</b>.</p>
+    <p class="page-sub">Grade and certificate hashes anchored in a smart contract on a local Ethereum node. Build: <b>${esc(chain.mode)}</b>.</p>
     ${banner}
     ${integrityCard}
-    <div class="card mt"><h3>Ledger blocks (${chain.height})</h3>
-      <div class="chain">${blocks || `<p class="muted">Empty ledger.</p>`}</div></div>`;
+    ${chain.enabled ? `<div class="card mt"><h3>Anchored events (${(chain.events || []).length}, newest first)</h3>
+      <div class="chain">${events || `<p class="muted">No events.</p>`}</div></div>` : ""}`;
 };
 
 // ---- chat ----

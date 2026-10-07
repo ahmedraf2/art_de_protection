@@ -25,33 +25,52 @@ build, then switch to the secure build and confirm the same request now fails.
 | **Admin** | manage all users; issue (sign) certifications; full messaging |
 
 Cross-cutting: JWT login, private messaging, digitally-signed certifications,
-encrypted message storage, and a blockchain integrity ledger that anchors grades
-and certifications (secure build).
+encrypted message storage, and a blockchain integrity ledger — a Solidity smart
+contract on a local Ethereum node — that anchors grades and certifications
+(secure build).
 
 ## Requirements
 
 - Python 3.8+
-- The `cryptography` package (AES-GCM encryption and Ed25519 signatures):
+- `Flask`, `cryptography` (AES-GCM + Ed25519) and `web3` (talks to the contract):
 
 ```bash
 pip install -r requirements.txt
 ```
 
+- [Foundry](https://getfoundry.sh) for the smart contract — `forge` compiles/tests
+  it, `anvil` is the local Ethereum node (needed by the secure build only):
+
+```bash
+curl -L https://foundry.paradigm.xyz | bash   # then open a new terminal
+foundryup
+cd contracts && forge build && forge test      # compile + run the 3 tests
+```
+
 ## Run
 
 ```bash
-# vulnerable build
+# 1. local Ethereum node (own terminal, keep it running; listens on 127.0.0.1 only)
+anvil --host 127.0.0.1 --port 8545 --chain-id 31337
+
+# 2. vulnerable build (does not use the chain)
 python3 app.py                      # http://127.0.0.1:3000
 
-# secure build (on a different port so you can compare side by side)
-APP_MODE=secure PORT=3001 python3 app.py
+# 3. secure build (on a different port so you can compare side by side)
+RESET_DB=1 APP_MODE=secure PORT=3001 python3 app.py
 
 # rebuild the database from scratch
 RESET_DB=1 python3 app.py
 ```
 
 The database (`sms_vuln.db` / `sms_secure.db`) and the crypto keys (`keys/`) are
-created automatically on first run.
+created automatically on first run. On a fresh database the secure build also
+generates an Ethereum issuer key (`keys/eth_issuer.key`), funds it from anvil's
+account #0, deploys `GradeLedger` and anchors the seed data
+(`keys/deployment.json` holds the contract address).
+
+anvil keeps no state: **after restarting anvil, restart the secure build with
+`RESET_DB=1`** (the app prints a reminder if the contract is missing).
 
 ## Demo accounts
 
@@ -88,7 +107,8 @@ Design & data flow: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 app.py            HTTP server, routing, all endpoints (vuln + secure branches)
 auth.py           JWT (HMAC-SHA256) + password hashing
 crypto_utils.py   AES-GCM encryption + Ed25519 certificate signatures
-blockchain.py     SHA-256 integrity ledger (anchors grades + certifications)
+eth_ledger.py     web3 client for the GradeLedger contract (anchor + verify)
+contracts/        Foundry project: src/GradeLedger.sol + test/
 db.py             database access + seed data
 schema.sql        database schema
 static/           front-end (index.html, app.js, style.css)

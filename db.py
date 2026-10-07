@@ -14,7 +14,7 @@ import sqlite3
 
 import auth
 import crypto_utils as cu
-import blockchain
+import eth_ledger
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_PATH = os.path.join(HERE, "schema.sql")
@@ -120,13 +120,27 @@ def init_db(mode, reset=False):
         os.remove(path)
     fresh = not os.path.exists(path)
 
+    if fresh and mode == "secure":
+        # SECURE: a fresh database gets a fresh GradeLedger contract, so the DB
+        # and the ledger always start out consistent.
+        try:
+            dep = eth_ledger.deploy()
+        except eth_ledger.LedgerUnavailable as e:
+            raise SystemExit(f"cannot deploy the integrity ledger: {e}")
+        print(f"  GradeLedger deployed at {dep['address']} (issuer {dep['issuer']})")
+
     conn = get_conn(mode)
     with open(SCHEMA_PATH) as f:
         # read the entire schema.sql , then execute it as a series of SQL statements using SQLite connection
         conn.executescript(f.read())
     # db_file not found means fresh start
     if fresh:
-        _seed(conn, mode)
+        try:
+            _seed(conn, mode)
+        except eth_ledger.LedgerUnavailable as e:
+            conn.close()
+            os.remove(path)               # don't keep a DB whose records aren't anchored
+            raise SystemExit(f"seeding failed, ledger unavailable: {e}")
     conn.commit()
     conn.close()
 
@@ -152,19 +166,16 @@ def _seed(conn, mode):
         conn.execute("INSERT INTO enrollments (course_id, student_id) VALUES (?,?)",
                      (cid[code], uid[student]))
 
-    # Establish the integrity ledger (genesis block) before anchoring records.
-    blockchain.ensure_genesis(conn, commit=False)
-
     for student, code, grade in GRADES:
         prof = uid["prof_smith"]
         conn.execute(
             "INSERT INTO grades (course_id, student_id, grade, updated_by) VALUES (?,?,?,?)",
             (cid[code], uid[student], grade, prof))
-        # Anchor each grade on the chain so later tampering with the grades
-        # table can be detected by comparing the DB against the ledger.
-        blockchain.add_block(conn, {"type": "grade", "course_id": cid[code],
-                                    "student_id": uid[student], "grade": grade,
-                                    "by": prof}, commit=False)
+        if mode == "secure":
+            # SECURE: anchor each grade's hash in the contract so later tampering
+            # with the grades table shows up as DB != ledger.
+            eth_ledger.anchor_grade(cid[code], uid[student],
+                                    eth_ledger.grade_hash(cid[code], uid[student], grade))
 
     for student, title, grade, date in CERTS:
         # SECURE: issuer signs the certificate. VULN mode leaves it unsigned,
@@ -173,13 +184,10 @@ def _seed(conn, mode):
         conn.execute(
             "INSERT INTO certifications (student_id, title, grade, issued_date, signature) "
             "VALUES (?,?,?,?,?)", (uid[student], title, grade, date, sig))
-        # Anchor the certificate's fingerprint on the chain so a forged or
-        # injected certificate can be spotted ("not on chain").
-        blockchain.add_block(conn, {
-            "type": "certification", "student_id": uid[student], "title": title,
-            "grade": grade, "issued_date": date,
-            "fingerprint": cu.cert_fingerprint(uid[student], title, grade, date),
-        }, commit=False)
+        if mode == "secure":
+            # SECURE: anchor the certificate's fingerprint so a forged or
+            # injected certificate can be spotted ("not on chain").
+            eth_ledger.anchor_cert(cu.cert_fingerprint(uid[student], title, grade, date))
 
     for i, (sender, recipient, body) in enumerate(CHATS):
         # SECURE: encrypt the body at rest. VULN mode stores plaintext, so anyone

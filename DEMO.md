@@ -1,12 +1,16 @@
 # Live demo run sheet
 
 A sequence for presenting each vulnerability, then the fix, in front of the class.
-Keep two terminals and a browser open.
+Keep three terminals and a browser open.
 
 ## Setup (before you start)
 
 ```bash
 pip install -r requirements.txt
+(cd contracts && forge build)                   # compile GradeLedger once
+
+# Terminal C — local Ethereum node (start it FIRST; the secure build needs it)
+anvil --host 127.0.0.1 --port 8545 --chain-id 31337
 
 # Terminal A — vulnerable build
 RESET_DB=1 python3 app.py                       # http://127.0.0.1:3000
@@ -191,12 +195,12 @@ API. You need both.
 
 ---
 
-## 8. Blockchain integrity ledger (tamper detection)
+## 8. Blockchain integrity ledger (smart contract)
 
-Open **Blockchain** in the sidebar. The secure build anchors every grade and
-certificate on a chain of SHA-256-linked blocks (each with a proof-of-work nonce);
-the page shows the blocks, a green "Ledger intact" banner, and a grade-integrity
-table where every row reads **✔ matches**.
+Open **Blockchain** in the sidebar on `$S`. The banner shows the `GradeLedger`
+contract address and the **issuer** — the only key allowed to write. Below it, the
+grade-integrity table (every row **✔ matches**) and the anchored events, each with
+its sender and transaction hash. On `$V` the page says there is no ledger at all.
 
 **Break (vuln build, `$V`):** change a grade straight in the database — the app has
 no way to notice:
@@ -206,36 +210,43 @@ sqlite3 sms_vuln.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND cour
 curl -s $V/api/grades/integrity -H "Authorization: Bearer $TOK"   # {"enforced": false}
 ```
 
-**Fix 1 — tampering with the records is caught (`$S`).** Do the same edit on the
-secure DB, then reload **Blockchain**: Mathematics now shows **DB 20.00 vs Ledger
-14.00 → ✘ TAMPERED** while the ledger banner stays intact (the chain is the trusted
-reference).
+**Fix 1 — DB tampering is detected (`$S`).** Same edit on the secure DB, then reload
+**Blockchain**: Mathematics shows **DB 20.00**, a DB hash different from the
+contract hash → **✘ TAMPERED**.
 
 ```bash
+TOKS=$(curl -s -X POST $S/api/login -H 'Content-Type: application/json' \
+      -d '{"username":"alice","password":"password1"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
 sqlite3 sms_secure.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
-curl -s $S/api/grades/integrity -H "Authorization: Bearer $TOK"   # Mathematics ok:false
+curl -s $S/api/grades/integrity -H "Authorization: Bearer $TOKS"   # Mathematics ok:false
 ```
 
 A certificate forged straight into the DB is caught twice — open **Certifications**:
-it shows **✘ invalid** (no valid signature) **and** **⚠ not on chain**:
+**✘ invalid** (no valid signature) **and** **⚠ not on chain**:
 
 ```bash
 sqlite3 sms_secure.db "INSERT INTO certifications (student_id,title,grade,issued_date,signature) \
   VALUES (4,'PhD in Computer Science','A+','2026-01-01','ZmFrZXNpZw==');"
 ```
 
-**Fix 2 — rewriting the ledger itself is caught (`$S`).** Try to edit history in a
-block; the banner flips to **✘ Ledger BROKEN** and names the block:
+**Fix 2 — the attacker can't fix up the ledger.** To hide the edit they would need
+to anchor the new hash. Try it from another account (anvil's public account #1):
 
 ```bash
-sqlite3 sms_secure.db "UPDATE blockchain SET data=replace(data,'14.00','20.00') WHERE idx=1;"
-curl -s $S/api/blockchain -H "Authorization: Bearer $TOK"   # valid:false, block 1 hash mismatch
+ADDR=$(jq -r .address keys/deployment.json)
+cast send $ADDR "anchorGrade(uint256,uint256,bytes32)" 1 4 $(cast keccak "20.00") \
+  --private-key 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d \
+  --rpc-url http://127.0.0.1:8545
+# Error: ... execution reverted: custom error 0x54ec5063 ... NotIssuer
+cast call $ADDR "issuer()(address)" --rpc-url http://127.0.0.1:8545   # the app's key
 ```
 
-**Explain:** signatures prove *who* issued a record; the ledger proves it *hasn't
-changed since*. Editing a block changes its hash and breaks the link to the next
-block, so the tampering can't be hidden. Re-seed to a clean state with
-`RESET_DB=1 APP_MODE=secure PORT=3001 python3 app.py`.
+**Explain:** the DB holds the records, the contract holds their hashes, in a separate
+process. Editing the DB breaks the match; fixing the contract needs the issuer's
+private key, which the `onlyIssuer` modifier enforces. Show `GradeLedger.sol`.
+
+Re-seed to a clean state with `RESET_DB=1 APP_MODE=secure PORT=3001 python3 app.py`
+(also required after restarting anvil — it keeps no state).
 
 ---
 
@@ -250,7 +261,7 @@ block, so the tampering can't be hidden. Re-seed to a clean state with
 | Privesc | client sets role | server sets role |
 | Access control | no role check | check role/ownership server-side |
 | Crypto | plaintext + unsigned | AES-GCM at rest + Ed25519 signatures |
-| Integrity | records trusted blindly | blockchain ledger: anchor on write, verify on read |
+| Integrity | records trusted blindly | issuer-only smart contract: anchor hashes on write, verify on read |
 
 > If you prefer to patch live instead of switching ports: open `app.py` / `auth.py`,
 > change the `# VULN` line to the `# SECURE` line shown right beside it, restart

@@ -318,19 +318,13 @@ both access control *and* encryption.
 ## 9. No integrity anchoring — grade/certificate tampering goes undetected
 
 **Where:** `app.py → h_set_grade`, `h_issue_cert`, `h_certifications`,
-`h_grade_integrity`; ledger in `blockchain.py`.
+`h_grade_integrity`; ledger in `eth_ledger.py` + `contracts/src/GradeLedger.sol`.
 
 The vuln build keeps academic records in the `grades` and `certifications` tables
 only. If an attacker reaches the database — via the SQL injection in #2, a stolen
 file, or direct access — they can change a grade or insert a diploma and nothing
 flags it: the application never cross-checks the records against an independent,
 tamper-evident source.
-
-The secure build anchors every grade and certificate on a small **blockchain**
-(`blockchain.py`): a chain of SHA-256-linked blocks, each carrying a proof-of-work
-nonce and the hash of the block before it. Because each block commits to its
-predecessor, editing any record changes that block's hash and breaks the chain, so
-`verify_chain()` pinpoints the tampered block.
 
 **Exploit** — in the vuln build, change a grade straight in the DB; the app shows it
 without question and offers no way to tell it was altered:
@@ -343,32 +337,43 @@ sqlite3 sms_vuln.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND cour
 **Impact:** silent, unattributable tampering with grades and certificates — the
 records an institution exists to vouch for.
 
-**Fix (secure build):** anchor on write and verify on read.
+**Fix (secure build):** anchor a hash of every record in a smart contract that only
+the issuer can write, and verify on read.
 
-1. *Tampering with the records is caught.* The `grades`/`certifications` tables are
-   compared against the ledger:
+- *On write*, `h_set_grade` / `h_issue_cert` compute the SHA-256 of the row as
+  stored and call `anchorGrade` / `anchorCertificate` on `GradeLedger`. The DB
+  change is committed only if the transaction succeeded; if anvil is down it is
+  rolled back and the API returns `503`.
+- *On read*, the hash is recomputed from the DB and compared with the contract:
 
-   ```bash
-   sqlite3 sms_secure.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
-   # GET /api/grades/integrity  -> Mathematics: db 20.00 vs ledger 14.00 -> ok:false (TAMPERED)
-   ```
+  ```bash
+  sqlite3 sms_secure.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
+  # GET /api/grades/integrity -> Mathematics: db_hash != chain_hash -> ok:false (TAMPERED)
+  ```
 
-   A certificate forged directly into the DB comes back `verified:false` **and**
-   `on_chain:false` (two independent red flags); a genuine one is `on_chain:true`.
+  A certificate inserted straight into the DB comes back `verified:false` **and**
+  `on_chain:false`; a genuine one is `on_chain:true`.
+- *The ledger itself cannot be fixed up* by the attacker: it lives in a separate
+  process (not in the SQLite file), and the contract's `onlyIssuer` modifier
+  rejects every write not signed by `keys/eth_issuer.key`:
 
-2. *Rewriting the ledger itself is caught.* Editing a block's data invalidates its
-   own hash; if the attacker recomputes that hash, the next block's `prev_hash` link
-   breaks instead — either way `verify_chain()` reports it:
+  ```solidity
+  modifier onlyIssuer() {
+      if (msg.sender != issuer) revert NotIssuer();
+      _;
+  }
+  ```
 
-   ```bash
-   sqlite3 sms_secure.db "UPDATE blockchain SET data=replace(data,'14.00','20.00') WHERE idx=1;"
-   # GET /api/blockchain  -> valid:false, block 1: "hash mismatch — data was altered"
-   ```
+  A write from any other account reverts with `NotIssuer()` (see DEMO §8).
 
 **Verify:** on the vuln build `GET /api/grades/integrity` returns
 `{"enforced": false}` and certificates carry no `on_chain` field; on the secure
-build grades show `ok:true` until tampered, and the ledger reports `valid:true`
-until a block is edited.
+build grades show `ok:true` until the DB is edited, and `cd contracts && forge test`
+shows a non-issuer write reverting.
+
+**Limits:** one local node is not decentralized, and whoever steals the issuer key
+(i.e. compromises the app server) can anchor false records. The fix protects
+against attackers who can write to the *database*, which is the threat here.
 
 ---
 
@@ -384,4 +389,4 @@ until a block is edited.
 | 6 | Broken access control (grades/certs/admin) | server-side role checks |
 | 7 | Unsalted MD5 passwords | PBKDF2 + salt |
 | 8 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |
-| 9 | No integrity anchoring (tampering undetected) | blockchain ledger: anchor on write, verify on read |
+| 9 | No integrity anchoring (tampering undetected) | issuer-only smart contract: anchor hashes on write, verify on read |

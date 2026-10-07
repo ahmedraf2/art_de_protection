@@ -33,8 +33,7 @@ def hash_password(password: str, mode: str):
     """Return (hash_hex, salt_or_None, scheme)."""
     if mode == "secure":
         salt = secrets.token_hex(16)
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode(),
-                                 bytes.fromhex(salt), PBKDF2_ITERATIONS)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), PBKDF2_ITERATIONS)
         return dk.hex(), salt, "pbkdf2"
     # VULN: unsalted MD5 stored in the database (fast to brute force / rainbow).
     return hashlib.md5(password.encode()).hexdigest(), None, "md5"

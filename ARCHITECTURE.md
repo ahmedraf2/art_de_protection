@@ -38,11 +38,12 @@ variable selects the vulnerable or the secure code path at runtime.
 ## Request lifecycle
 
 1. A request arrives with credentials in the `Authorization: Bearer <JWT>` header.
-2. `route()` matches `METHOD + path` against the `ROUTES` table and opens a
-   per-request DB connection.
-3. `whoami()` decodes the JWT — `jwt_decode_vuln` (no verification) or
-   `jwt_decode_secure` (verify alg + signature + expiry), depending on the build.
-4. The handler enforces authorization (secure build only), runs its query through
+2. Flask dispatches it to the matching view; `get_db()` opens a per-request SQLite
+   connection (closed again by a `teardown_request` hook).
+3. The `@require_auth` decorator calls `whoami()`, which decodes the JWT —
+   `jwt_decode_vuln` (no verification) or `jwt_decode_secure` (verify alg +
+   signature + expiry), depending on the build — and stashes the identity on `g`.
+4. The view enforces authorization (secure build only), runs its query through
    `db.run` (parameterized) or `db.run_raw` (concatenated), and returns JSON.
 
 ## Roles and data model

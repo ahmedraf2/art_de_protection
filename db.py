@@ -122,7 +122,9 @@ def init_db(mode, reset=False):
 
     conn = get_conn(mode)
     with open(SCHEMA_PATH) as f:
+        # read the entire schema.sql , then execute it as a series of SQL statements using SQLite connection
         conn.executescript(f.read())
+    # db_file not found means fresh start
     if fresh:
         _seed(conn, mode)
     conn.commit()

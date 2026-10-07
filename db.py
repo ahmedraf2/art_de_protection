@@ -14,6 +14,7 @@ import sqlite3
 
 import auth
 import crypto_utils as cu
+import blockchain
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_PATH = os.path.join(HERE, "schema.sql")
@@ -149,10 +150,19 @@ def _seed(conn, mode):
         conn.execute("INSERT INTO enrollments (course_id, student_id) VALUES (?,?)",
                      (cid[code], uid[student]))
 
+    # Establish the integrity ledger (genesis block) before anchoring records.
+    blockchain.ensure_genesis(conn, commit=False)
+
     for student, code, grade in GRADES:
+        prof = uid["prof_smith"]
         conn.execute(
             "INSERT INTO grades (course_id, student_id, grade, updated_by) VALUES (?,?,?,?)",
-            (cid[code], uid[student], grade, uid["prof_smith"]))
+            (cid[code], uid[student], grade, prof))
+        # Anchor each grade on the chain so later tampering with the grades
+        # table can be detected by comparing the DB against the ledger.
+        blockchain.add_block(conn, {"type": "grade", "course_id": cid[code],
+                                    "student_id": uid[student], "grade": grade,
+                                    "by": prof}, commit=False)
 
     for student, title, grade, date in CERTS:
         # SECURE: issuer signs the certificate. VULN mode leaves it unsigned,
@@ -161,6 +171,13 @@ def _seed(conn, mode):
         conn.execute(
             "INSERT INTO certifications (student_id, title, grade, issued_date, signature) "
             "VALUES (?,?,?,?,?)", (uid[student], title, grade, date, sig))
+        # Anchor the certificate's fingerprint on the chain so a forged or
+        # injected certificate can be spotted ("not on chain").
+        blockchain.add_block(conn, {
+            "type": "certification", "student_id": uid[student], "title": title,
+            "grade": grade, "issued_date": date,
+            "fingerprint": cu.cert_fingerprint(uid[student], title, grade, date),
+        }, commit=False)
 
     for i, (sender, recipient, body) in enumerate(CHATS):
         # SECURE: encrypt the body at rest. VULN mode stores plaintext, so anyone

@@ -59,6 +59,7 @@ const NAV = [
   { view: "chat", label: "Chat", icon: "💬", roles: ["student", "professor", "admin"] },
   { view: "courses", label: "Courses", icon: "📚", roles: ["student", "professor", "admin"] },
   { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student", "professor", "admin"] },
+  { view: "blockchain", label: "Blockchain", icon: "⛓️", roles: ["student", "professor", "admin"] },
   { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor", "admin"] },
   { view: "admin", label: "Admin", icon: "⚙️", roles: ["admin"] },
 ];
@@ -185,15 +186,64 @@ VIEWS.courses = async function () {
 VIEWS.certifications = async function (params) {
   const sid = params.get("student_id");
   const d = await get("/api/certifications" + (sid ? "?student_id=" + encodeURIComponent(sid) : ""));
+  const ledgerCell = (c) => {
+    if (c.on_chain === undefined) return `<span class="muted">—</span>`;
+    return c.on_chain ? `<span class="pill g">&#9939; on&#8209;chain</span>`
+                      : `<span class="pill b">&#9888; not on chain</span>`;
+  };
   const rows = (d.certifications || []).map(c => `
     <tr><td>${esc(c.full_name || "")}</td><td>${esc(c.title)}</td><td>${esc(c.grade)}</td>
     <td>${esc(c.issued_date)}</td>
-    <td>${c.verified ? `<span class="pill g">&#10004; valid</span>` : `<span class="pill b">&#10008; invalid</span>`}</td></tr>`).join("");
+    <td>${c.verified ? `<span class="pill g">&#10004; valid</span>` : `<span class="pill b">&#10008; invalid</span>`}</td>
+    <td>${ledgerCell(c)}</td></tr>`).join("");
   $("content").innerHTML = `
     <div class="page-title">Certifications</div>
-    <p class="page-sub">Your issued certifications, verified against the campus signing key.</p>
-    <div class="card"><table><thead><tr><th>Student</th><th>Title</th><th>Grade</th><th>Issued</th><th>Signature</th></tr></thead>
-    <tbody>${rows || `<tr><td colspan="5" class="muted">No certifications.</td></tr>`}</tbody></table></div>`;
+    <p class="page-sub">Your issued certifications, verified against the campus signing key and integrity ledger.</p>
+    <div class="card"><table><thead><tr><th>Student</th><th>Title</th><th>Grade</th><th>Issued</th><th>Signature</th><th>Ledger</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="6" class="muted">No certifications.</td></tr>`}</tbody></table></div>`;
+};
+
+// ---- blockchain / integrity ledger ----
+function shortHash(h) { return h ? h.slice(0, 10) + "…" + h.slice(-6) : ""; }
+
+VIEWS.blockchain = async function () {
+  const [chain, integ] = await Promise.all([get("/api/blockchain"), get("/api/grades/integrity")]);
+  const banner = chain.valid
+    ? `<div class="chain-banner ok">&#9939; Ledger intact — ${chain.height} blocks verified (SHA-256 links + proof-of-work).</div>`
+    : `<div class="chain-banner bad">&#9888; Ledger BROKEN — ${(chain.problems || []).map(p => `block ${p.idx}: ${esc(p.error)}`).join("; ")}</div>`;
+
+  let integrityCard;
+  if (integ.enforced) {
+    const rows = (integ.rows || []).map(r => `
+      <tr><td>${esc(r.name)}</td><td>${gradePill(r.db_grade)}</td>
+      <td>${r.ledger_grade == null ? `<span class="muted">—</span>` : gradePill(r.ledger_grade)}</td>
+      <td>${r.ok ? `<span class="pill g">&#10004; matches</span>` : `<span class="pill b">&#10008; TAMPERED</span>`}</td></tr>`).join("");
+    integrityCard = `<div class="card mt"><h3>Grade integrity check</h3>
+      <p class="muted">Every grade in the database is compared against the value anchored on the ledger.</p>
+      <table><thead><tr><th>Subject</th><th>Database</th><th>Ledger</th><th>Status</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="4" class="muted">No grades to check.</td></tr>`}</tbody></table></div>`;
+  } else {
+    integrityCard = `<div class="card mt"><h3>Grade integrity check</h3>
+      <p class="pill b">&#9888; Disabled in this build — the application never cross-checks grades against the ledger, so a tampered grade is accepted.</p></div>`;
+  }
+
+  const blocks = (chain.blocks || []).map(b => `
+    <div class="block ${esc(b.type || "")}">
+      <div class="block-top"><span class="block-idx">#${b.idx}</span>
+        <span class="block-type">${esc(b.type || "record")}</span>
+        <span class="muted">${esc(fmtDate(b.timestamp))}</span></div>
+      <div class="block-sum">${esc(b.summary)}</div>
+      <div class="hashline"><span class="k">prev</span><code>${shortHash(b.prev_hash)}</code></div>
+      <div class="hashline"><span class="k">hash</span><code>${shortHash(b.hash)}</code><span class="muted">nonce ${b.nonce}</span></div>
+    </div>`).join("");
+
+  $("content").innerHTML = `
+    <div class="page-title">Integrity ledger</div>
+    <p class="page-sub">A tamper-evident blockchain anchoring grades and certifications. Build: <b>${esc(chain.mode)}</b>.</p>
+    ${banner}
+    ${integrityCard}
+    <div class="card mt"><h3>Ledger blocks (${chain.height})</h3>
+      <div class="chain">${blocks || `<p class="muted">Empty ledger.</p>`}</div></div>`;
 };
 
 // ---- chat ----

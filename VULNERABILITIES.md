@@ -315,6 +315,63 @@ both access control *and* encryption.
 
 ---
 
+## 9. No integrity anchoring — grade/certificate tampering goes undetected
+
+**Where:** `app.py → h_set_grade`, `h_issue_cert`, `h_certifications`,
+`h_grade_integrity`; ledger in `blockchain.py`.
+
+The vuln build keeps academic records in the `grades` and `certifications` tables
+only. If an attacker reaches the database — via the SQL injection in #2, a stolen
+file, or direct access — they can change a grade or insert a diploma and nothing
+flags it: the application never cross-checks the records against an independent,
+tamper-evident source.
+
+The secure build anchors every grade and certificate on a small **blockchain**
+(`blockchain.py`): a chain of SHA-256-linked blocks, each carrying a proof-of-work
+nonce and the hash of the block before it. Because each block commits to its
+predecessor, editing any record changes that block's hash and breaks the chain, so
+`verify_chain()` pinpoints the tampered block.
+
+**Exploit** — in the vuln build, change a grade straight in the DB; the app shows it
+without question and offers no way to tell it was altered:
+
+```bash
+sqlite3 sms_vuln.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
+# /api/grades/integrity -> {"enforced": false}  (no check at all)
+```
+
+**Impact:** silent, unattributable tampering with grades and certificates — the
+records an institution exists to vouch for.
+
+**Fix (secure build):** anchor on write and verify on read.
+
+1. *Tampering with the records is caught.* The `grades`/`certifications` tables are
+   compared against the ledger:
+
+   ```bash
+   sqlite3 sms_secure.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
+   # GET /api/grades/integrity  -> Mathematics: db 20.00 vs ledger 14.00 -> ok:false (TAMPERED)
+   ```
+
+   A certificate forged directly into the DB comes back `verified:false` **and**
+   `on_chain:false` (two independent red flags); a genuine one is `on_chain:true`.
+
+2. *Rewriting the ledger itself is caught.* Editing a block's data invalidates its
+   own hash; if the attacker recomputes that hash, the next block's `prev_hash` link
+   breaks instead — either way `verify_chain()` reports it:
+
+   ```bash
+   sqlite3 sms_secure.db "UPDATE blockchain SET data=replace(data,'14.00','20.00') WHERE idx=1;"
+   # GET /api/blockchain  -> valid:false, block 1: "hash mismatch — data was altered"
+   ```
+
+**Verify:** on the vuln build `GET /api/grades/integrity` returns
+`{"enforced": false}` and certificates carry no `on_chain` field; on the secure
+build grades show `ok:true` until tampered, and the ledger reports `valid:true`
+until a block is edited.
+
+---
+
 ## Summary
 
 | # | Vulnerability | Fix |
@@ -327,3 +384,4 @@ both access control *and* encryption.
 | 6 | Broken access control (grades/certs/admin) | server-side role checks |
 | 7 | Unsalted MD5 passwords | PBKDF2 + salt |
 | 8 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |
+| 9 | No integrity anchoring (tampering undetected) | blockchain ledger: anchor on write, verify on read |

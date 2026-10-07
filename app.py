@@ -21,6 +21,7 @@ from urllib.parse import urlparse, parse_qs
 import auth
 import db
 import crypto_utils as cu
+import blockchain
 
 MODE = os.environ.get("APP_MODE", "vuln").lower()
 if MODE not in ("vuln", "secure"):
@@ -271,11 +272,15 @@ def h_certifications(self, conn, match, query):
 
     for c in rows:
         if MODE == "vuln":
-            # VULN: signatures are never checked, so a forged cert looks valid.
+            # VULN: signatures are never checked and the ledger is never consulted,
+            # so a forged certificate looks exactly like a real one.
             c["verified"] = True
         else:
             c["verified"] = cu.verify_cert(c["student_id"], c["title"], c["grade"],
                                            c["issued_date"], c.get("signature"))
+            # SECURE: also confirm the certificate is anchored on the ledger.
+            fp = cu.cert_fingerprint(c["student_id"], c["title"], c["grade"], c["issued_date"])
+            c["on_chain"] = bool(blockchain.find(conn, type="certification", fingerprint=fp))
     self.send_json(200, {"certifications": rows})
 
 
@@ -299,6 +304,15 @@ def h_issue_cert(self, conn, match, query):
     conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
                  "signature) VALUES (?,?,?,?,?)", (student_id, title, grade, issued, sig))
     conn.commit()
+
+    if MODE == "secure":
+        # SECURE: anchor the certificate's fingerprint so anyone can later check
+        # that it was really issued here (a forged cert will be "not on chain").
+        blockchain.add_block(conn, {
+            "type": "certification", "student_id": student_id, "title": title,
+            "grade": grade, "issued_date": issued,
+            "fingerprint": cu.cert_fingerprint(student_id, title, grade, issued)})
+    # VULN: the certificate is neither signed nor anchored.
     self.send_json(201, {"ok": True})
 
 
@@ -330,6 +344,15 @@ def h_set_grade(self, conn, match, query):
         conn.execute("INSERT INTO grades (course_id, student_id, grade, updated_by) "
                      "VALUES (?,?,?,?)", (course_id, student_id, grade, ident.get("sub")))
     conn.commit()
+
+    if MODE == "secure":
+        # SECURE: anchor every legitimate grade change on the integrity ledger,
+        # so a later direct edit to the grades table shows up as DB != chain.
+        blockchain.add_block(conn, {"type": "grade", "course_id": course_id,
+                                    "student_id": student_id, "grade": grade,
+                                    "by": ident.get("sub")})
+    # VULN: nothing is anchored and nothing is verified, so tampering with the
+    # grades table afterwards goes completely unnoticed.
     self.send_json(200, {"ok": True})
 
 
@@ -468,6 +491,59 @@ def h_admin_users(self, conn, match, query):
         return self.send_json(200, {"users": [public_user(u) for u in users]})
 
 
+# ==========================================================================
+# Integrity ledger (blockchain)
+# ==========================================================================
+def _block_summary(b):
+    d = b.get("data") or {}
+    t = d.get("type")
+    if t == "genesis":
+        return "Genesis block"
+    if t == "grade":
+        return f"Grade · course {d.get('course_id')} · student {d.get('student_id')} = {d.get('grade')}/20"
+    if t == "certification":
+        return f"Certification · \"{d.get('title')}\" → student {d.get('student_id')}"
+    return t or "record"
+
+
+def h_blockchain(self, conn, match, query):
+    """The integrity ledger and its live verification result (any user)."""
+    if not self.whoami(conn):
+        return self.send_json(401, {"error": "authentication required"})
+    ok, problems = blockchain.verify_chain(conn)
+    out = [{
+        "idx": b["idx"], "timestamp": b["timestamp"],
+        "type": (b["data"] or {}).get("type"), "summary": _block_summary(b),
+        "data": b["data"], "prev_hash": b["prev_hash"],
+        "hash": b["hash"], "nonce": b["nonce"],
+    } for b in blockchain.blocks(conn)]
+    self.send_json(200, {"mode": MODE, "height": len(out),
+                         "valid": ok, "problems": problems, "blocks": out})
+
+
+def h_grade_integrity(self, conn, match, query):
+    """Compare the caller's grades in the DB against the ledger (tamper check)."""
+    ident = self.whoami(conn)
+    if not ident:
+        return self.send_json(401, {"error": "authentication required"})
+    if MODE == "vuln":
+        # VULN: the app never cross-checks the grades table against the ledger,
+        # so a tampered grade is accepted at face value.
+        return self.send_json(200, {"enforced": False, "rows": []})
+    uid = ident.get("sub")
+    grades = db.run(conn,
+        "SELECT g.course_id, g.grade, c.code, c.name FROM grades g "
+        "JOIN courses c ON c.id = g.course_id WHERE g.student_id = ? ORDER BY c.name", (uid,))
+    ok, _ = blockchain.verify_chain(conn)
+    rows = []
+    for g in grades:
+        anchored = blockchain.find(conn, type="grade", student_id=uid, course_id=g["course_id"])
+        ledger_grade = anchored[-1]["data"].get("grade") if anchored else None
+        rows.append({"code": g["code"], "name": g["name"], "db_grade": g["grade"],
+                     "ledger_grade": ledger_grade, "ok": ledger_grade == g["grade"]})
+    self.send_json(200, {"enforced": True, "chain_valid": ok, "rows": rows})
+
+
 ROUTES = [
     ("GET",  re.compile(r"^/api/config$"),              h_config),
     ("GET",  re.compile(r"^/api/pubkey$"),              h_pubkey),
@@ -485,6 +561,8 @@ ROUTES = [
     ("GET",  re.compile(r"^/api/chat$"),                 h_chat),
     ("POST", re.compile(r"^/api/chat$"),                 h_chat_send),
     ("GET",  re.compile(r"^/api/admin/users$"),          h_admin_users),
+    ("GET",  re.compile(r"^/api/grades/integrity$"),     h_grade_integrity),
+    ("GET",  re.compile(r"^/api/blockchain$"),           h_blockchain),
 ]
 
 

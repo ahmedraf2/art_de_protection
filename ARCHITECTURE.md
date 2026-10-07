@@ -21,6 +21,7 @@ variable selects the vulnerable or the secure code path at runtime.
    │   · JWT (HMAC)    · AES-256-GCM       · run()  (bound params)│
    │   · pwd hashing   · Ed25519 sign      · run_raw() (concat)   │
    │                   · verify            · seed / schema        │
+   │   blockchain.py — SHA-256 integrity ledger (anchor + verify) │
    └────────────────────────────────┬───────────────────────────┘
                                      ▼
                          ┌───────────────────────────┐
@@ -28,7 +29,8 @@ variable selects the vulnerable or the secure code path at runtime.
                          │  sms_vuln.db / sms_secure  │
                          │  users, courses,           │
                          │  enrollments, grades,      │
-                         │  certifications, messages  │
+                         │  certifications, messages, │
+                         │  blockchain                │
                          └───────────────────────────┘
                          keys/  (AES key + Ed25519 keypair, generated on first run)
 ```
@@ -54,6 +56,7 @@ enrollments(id, course_id→courses, student_id→users)
 grades(id, course_id→courses, student_id→users, grade, updated_by)
 certifications(id, student_id→users, title, grade, issued_date, signature)
 messages(id, sender_id→users, recipient_id→users, subject, body, is_encrypted)
+blockchain(idx, timestamp, data, prev_hash, nonce, hash)
 ```
 `⋆` = unique. Authoritative DDL: [schema.sql](schema.sql).
 
@@ -71,6 +74,14 @@ messages(id, sender_id→users, recipient_id→users, subject, body, is_encrypte
   Ed25519 issuer key over a canonical JSON of `{student_id, title, grade,
   issued_date}`. The public key is exposed at `GET /api/pubkey` for independent
   verification. Any field change invalidates the signature.
+- **Integrity ledger** (`blockchain.py`): grades and certifications are anchored on
+  a local blockchain — a chain of SHA-256-linked blocks, each with a small
+  proof-of-work nonce. Every block commits to the previous block's hash, so editing
+  any record changes its hash and breaks the chain. `verify_chain()` recomputes and
+  re-links the whole chain; `GET /api/blockchain` returns it and its validity, and
+  `GET /api/grades/integrity` compares the grades table against the ledger. The
+  secure build anchors on write and verifies on read; the vuln build does neither,
+  so DB tampering and forged certificates go undetected.
 
 ## The security model in one line
 

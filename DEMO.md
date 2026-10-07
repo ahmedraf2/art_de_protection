@@ -191,6 +191,54 @@ API. You need both.
 
 ---
 
+## 8. Blockchain integrity ledger (tamper detection)
+
+Open **Blockchain** in the sidebar. The secure build anchors every grade and
+certificate on a chain of SHA-256-linked blocks (each with a proof-of-work nonce);
+the page shows the blocks, a green "Ledger intact" banner, and a grade-integrity
+table where every row reads **✔ matches**.
+
+**Break (vuln build, `$V`):** change a grade straight in the database — the app has
+no way to notice:
+
+```bash
+sqlite3 sms_vuln.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
+curl -s $V/api/grades/integrity -H "Authorization: Bearer $TOK"   # {"enforced": false}
+```
+
+**Fix 1 — tampering with the records is caught (`$S`).** Do the same edit on the
+secure DB, then reload **Blockchain**: Mathematics now shows **DB 20.00 vs Ledger
+14.00 → ✘ TAMPERED** while the ledger banner stays intact (the chain is the trusted
+reference).
+
+```bash
+sqlite3 sms_secure.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1;"
+curl -s $S/api/grades/integrity -H "Authorization: Bearer $TOK"   # Mathematics ok:false
+```
+
+A certificate forged straight into the DB is caught twice — open **Certifications**:
+it shows **✘ invalid** (no valid signature) **and** **⚠ not on chain**:
+
+```bash
+sqlite3 sms_secure.db "INSERT INTO certifications (student_id,title,grade,issued_date,signature) \
+  VALUES (4,'PhD in Computer Science','A+','2026-01-01','ZmFrZXNpZw==');"
+```
+
+**Fix 2 — rewriting the ledger itself is caught (`$S`).** Try to edit history in a
+block; the banner flips to **✘ Ledger BROKEN** and names the block:
+
+```bash
+sqlite3 sms_secure.db "UPDATE blockchain SET data=replace(data,'14.00','20.00') WHERE idx=1;"
+curl -s $S/api/blockchain -H "Authorization: Bearer $TOK"   # valid:false, block 1 hash mismatch
+```
+
+**Explain:** signatures prove *who* issued a record; the ledger proves it *hasn't
+changed since*. Editing a block changes its hash and breaks the link to the next
+block, so the tampering can't be hidden. Re-seed to a clean state with
+`RESET_DB=1 APP_MODE=secure PORT=3001 python3 app.py`.
+
+---
+
 ## One-line recap for each fix
 
 | Vuln | Root cause | Fix |
@@ -202,6 +250,7 @@ API. You need both.
 | Privesc | client sets role | server sets role |
 | Access control | no role check | check role/ownership server-side |
 | Crypto | plaintext + unsigned | AES-GCM at rest + Ed25519 signatures |
+| Integrity | records trusted blindly | blockchain ledger: anchor on write, verify on read |
 
 > If you prefer to patch live instead of switching ports: open `app.py` / `auth.py`,
 > change the `# VULN` line to the `# SECURE` line shown right beside it, restart

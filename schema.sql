@@ -51,6 +51,18 @@ CREATE TABLE IF NOT EXISTS certifications (
     FOREIGN KEY (student_id) REFERENCES users(id)
 );
 
+-- Tamper-evident integrity ledger (see blockchain.py). Each block is
+-- SHA-256-linked to the previous one, so editing any row below breaks the
+-- chain and verify_chain() reports exactly where.
+CREATE TABLE IF NOT EXISTS blockchain (
+    idx        INTEGER PRIMARY KEY,   -- block height (0 = genesis)
+    timestamp  TEXT NOT NULL,
+    data       TEXT NOT NULL,         -- canonical JSON of the anchored record
+    prev_hash  TEXT NOT NULL,         -- hash of the previous block
+    nonce      INTEGER NOT NULL,      -- proof-of-work nonce
+    hash       TEXT NOT NULL          -- SHA-256 of this block
+);
+
 -- Private messages between users.
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

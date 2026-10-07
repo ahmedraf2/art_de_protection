@@ -24,8 +24,9 @@ build, then switch to the secure build and confirm the same request now fails.
 | **Professor** | see own courses and students; enter grades; messages |
 | **Admin** | manage all users; issue (sign) certifications; full messaging |
 
-Cross-cutting: JWT login, private messaging, digitally-signed certifications, and
-encrypted message storage (secure build).
+Cross-cutting: JWT login, private messaging, digitally-signed certifications,
+encrypted message storage, and a blockchain integrity ledger that anchors grades
+and certifications (secure build).
 
 ## Requirements
 
@@ -75,6 +76,7 @@ created automatically on first run.
 | 6 | Broken access control (grading, cert issuance, admin) | `POST /api/grades`, `POST /api/certifications`, `GET /api/admin/users` |
 | 7 | Insecure password hashing (unsalted MD5) | `auth.hash_password` |
 | 8 | Missing signature / encryption at rest | certifications & messages |
+| 9 | No integrity anchoring (grade/cert tampering undetected) | `GET /api/grades/integrity`, `GET /api/blockchain` |
 
 Full exploit steps and fixes: **[VULNERABILITIES.md](VULNERABILITIES.md)**.
 Step-by-step live-demo script: **[DEMO.md](DEMO.md)**.
@@ -86,6 +88,7 @@ Design & data flow: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 app.py            HTTP server, routing, all endpoints (vuln + secure branches)
 auth.py           JWT (HMAC-SHA256) + password hashing
 crypto_utils.py   AES-GCM encryption + Ed25519 certificate signatures
+blockchain.py     SHA-256 integrity ledger (anchors grades + certifications)
 db.py             database access + seed data
 schema.sql        database schema
 static/           front-end (index.html, app.js, style.css)

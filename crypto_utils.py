@@ -12,6 +12,7 @@ Keys are generated on first run and kept in ./keys (git-ignored).
 import os
 import json
 import base64
+import hashlib
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -96,6 +97,11 @@ def cert_payload(student_id, title, grade, issued_date) -> bytes:
          "grade": grade, "issued_date": issued_date},
         sort_keys=True, separators=(",", ":"),
     ).encode()
+
+
+def cert_fingerprint(student_id, title, grade, issued_date) -> str:
+    """SHA-256 of the canonical certificate payload, used to anchor it on-chain."""
+    return hashlib.sha256(cert_payload(student_id, title, grade, issued_date)).hexdigest()
 
 
 def sign_cert(student_id, title, grade, issued_date) -> str:

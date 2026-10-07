@@ -81,8 +81,32 @@ async function enterApp() {
   $("sidebar").innerHTML = NAV.filter(n => n.roles.includes(USER.role) && !(n.secureOnly && MODE !== "secure"))
     .map(n => `<button data-view="${n.view}" onclick="nav('${n.view}')"><span>${n.icon}</span> ${n.label}</button>`).join("");
 
+  // the secure build lets an admin watch for DB tampering from anywhere in the app
+  if (MODE === "secure" && USER.role === "admin") startIntegrityWatch();
+
   if (!location.hash) location.hash = "dashboard";
   route();
+}
+
+// ---- admin tamper watch (secure build) ----
+let _integrityTimer = null;
+function startIntegrityWatch() {
+  checkIntegrityBadge();
+  clearInterval(_integrityTimer);
+  _integrityTimer = setInterval(checkIntegrityBadge, 8000);   // near-immediate alert
+}
+async function checkIntegrityBadge() {
+  const { status, data } = await api("GET", "/api/admin/integrity");
+  const btn = document.querySelector('#sidebar button[data-view="admin"]');
+  if (!btn) return;
+  btn.querySelector(".nav-badge")?.remove();
+  const n = (status === 200 && data.available) ? (data.alerts || []).length : 0;
+  if (n > 0) {
+    const b = document.createElement("span");
+    b.className = "nav-badge";
+    b.textContent = n;
+    btn.appendChild(b);
+  }
 }
 
 function nav(v) { location.hash = v; }
@@ -381,6 +405,7 @@ async function saveGrade() {
 VIEWS.admin = async function () {
   $("content").innerHTML = `
     <div class="page-title">Administration</div><p class="page-sub">Manage users and issue certifications</p>
+    ${MODE === "secure" ? `<div id="integrity-box" class="mt muted">Checking integrity ledger…</div>` : ""}
     <div class="card"><h3>All users</h3><div id="admin-users" class="mt muted">Loading…</div></div>
     <div class="card mt" style="max-width:640px"><h3>Issue certification</h3>
       <div class="grid-2">
@@ -398,7 +423,57 @@ VIEWS.admin = async function () {
   const cols = Object.keys(d.users[0]);
   box.innerHTML = `<table><thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead>
     <tbody>${d.users.map(u => `<tr>${cols.map(c => `<td>${esc(u[c])}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  if (MODE === "secure") renderIntegrityAlerts();
 };
+
+// Admin tamper monitor: shows grades whose DB value no longer matches the ledger,
+// with a one-click restore to the issuer-anchored value.
+async function renderIntegrityAlerts() {
+  const box = $("integrity-box");
+  if (!box) return;
+  const { status, data } = await api("GET", "/api/admin/integrity");
+  if (status !== 200 || !data.available) {
+    box.className = "card alert-card warn mt";
+    box.innerHTML = `<h3>&#9888; Integrity monitor</h3>
+      <p class="muted">Ledger unavailable — ${esc((data && data.error) || "cannot reach the node")}.</p>`;
+    return;
+  }
+  const alerts = data.alerts || [];
+  if (!alerts.length) {
+    box.className = "card alert-card ok mt";
+    box.innerHTML = `<h3>&#9939; Integrity monitor</h3>
+      <p class="ok-text">&#10004; All grades match the integrity ledger. No tampering detected.</p>`;
+    return;
+  }
+  box.className = "card alert-card bad mt";
+  const rows = alerts.map(a => `
+    <tr>
+      <td>${esc(a.student)}</td><td>${esc(a.course)}</td>
+      <td><span class="pill b strike">${esc(a.db_grade)}</span></td>
+      <td>${a.true_grade != null ? `<span class="pill g">${esc(a.true_grade)}</span>`
+                                  : `<span class="pill o">unknown</span>`}</td>
+      <td>${a.true_grade != null
+            ? `<button class="btn-ghost sm" onclick="fixGrade(${a.course_id}, ${a.student_id})">Restore</button>`
+            : `<span class="muted">manual</span>`}</td>
+    </tr>`).join("");
+  box.innerHTML = `
+    <div class="alert-head">
+      <h3>&#9888; Tampering detected — ${alerts.length} grade${alerts.length > 1 ? "s" : ""}</h3>
+      <button class="btn-primary sm" onclick="fixGrade()">Restore all from ledger</button>
+    </div>
+    <p class="muted">A grade below was changed directly in the database and no longer matches the value
+      the issuer anchored on-chain. Restoring rewrites the database back to the verified value.</p>
+    <table><thead><tr><th>Student</th><th>Course</th><th>In database</th><th>Verified (ledger)</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+}
+
+async function fixGrade(course_id, student_id) {
+  const body = (course_id === undefined) ? {} : { course_id, student_id };
+  const { status, data } = await api("POST", "/api/admin/integrity/fix", body);
+  if (status !== 200) { alert((data && data.error) || "Restore failed"); return; }
+  await renderIntegrityAlerts();   // alerts clear once the DB matches the ledger again
+  checkIntegrityBadge();           // refresh the sidebar badge
+}
 async function issueCert() {
   const { status, data } = await api("POST", "/api/certifications", {
     student_id: Number($("ic-sid").value), title: $("ic-title").value,

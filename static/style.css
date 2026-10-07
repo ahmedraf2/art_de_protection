@@ -114,6 +114,19 @@ tr:last-child td { border-bottom: none; }
 .verified-badge { font-size: .7rem; font-weight: 600; color: var(--good); background: rgba(53,194,129,.12); border-radius: 20px; padding: 2px 9px; margin-left: 8px; vertical-align: middle; }
 .tamper-note { color: var(--warn); font-size: .82rem; margin: 2px 0 10px; }
 
+/* admin tamper monitor */
+.nav-badge { display: inline-block; min-width: 18px; height: 18px; line-height: 18px; text-align: center;
+  background: var(--bad); color: #fff; border-radius: 10px; font-size: .72rem; font-weight: 700;
+  padding: 0 5px; margin-left: 8px; }
+.alert-card { border: 1px solid var(--line); }
+.alert-card.ok { border-color: rgba(53,194,129,.4); background: rgba(53,194,129,.07); }
+.alert-card.bad { border-color: rgba(240,106,106,.45); background: rgba(240,106,106,.07); }
+.alert-card.warn { border-color: rgba(242,183,80,.45); background: rgba(242,183,80,.07); }
+.alert-card .ok-text { color: var(--good); font-weight: 600; margin: 4px 0 0; }
+.alert-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.alert-head h3 { color: var(--bad); margin: 0; }
+.btn-ghost.sm, .btn-primary.sm { padding: 4px 12px; font-size: .8rem; }
+
 /* course cards */
 .course { background: var(--panel2); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
 .course .code { font-size: .78rem; color: var(--accent); font-weight: 700; letter-spacing: .5px; }

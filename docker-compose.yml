@@ -17,8 +17,11 @@
 # The project folder is mounted into the containers, so the databases and keys/
 # are created in this folder, owned by you (uid 1000).
 #
-# anvil keeps no state, so every `up` starts a fresh chain and both apps start
-# with RESET_DB=1 (fresh DB, fresh contract, seed data re-anchored).
+# State persists across restarts: anvil keeps its chain in ./.anvil and each app
+# keeps its sms_*.db, so `docker compose restart` (or down/up) resumes where you
+# left off. To start over from seed data:
+#     RESET_DB=1 docker compose up          # fresh DB + fresh contract + re-anchor
+#     docker compose down && rm -rf .anvil sms_*.db keys/deployment.json && docker compose up   # full wipe
 
 x-app: &app
   build: .
@@ -39,7 +42,14 @@ services:
   anvil:
     image: ghcr.io/foundry-rs/foundry:latest
     network_mode: host
-    entrypoint: ["anvil", "--host", "127.0.0.1", "--port", "8545", "--chain-id", "31337"]
+    user: "0:0"                     # own the ./.anvil bind dir so state can be written
+    # --state keeps the chain (deployed contract + every anchor) in a file, so a
+    # restart reloads it instead of starting an empty chain. --state-interval also
+    # dumps periodically, so state survives an ungraceful stop.
+    entrypoint: ["anvil", "--host", "127.0.0.1", "--port", "8545", "--chain-id", "31337",
+                 "--state", "/state/anvil-state.json", "--state-interval", "5"]
+    volumes:
+      - ./.anvil:/state
     healthcheck:
       test: ["CMD-SHELL", "cast chain-id --rpc-url http://127.0.0.1:8545"]
       interval: 2s
@@ -59,7 +69,9 @@ services:
     environment:
       APP_MODE: secure
       PORT: "3001"
-      RESET_DB: "1"
+      # Persist the DB across restarts. Run `RESET_DB=1 docker compose up` to
+      # rebuild+reseed the database (and re-anchor) from scratch.
+      RESET_DB: "${RESET_DB:-}"
     depends_on:
       keys:
         condition: service_completed_successfully
@@ -79,7 +91,7 @@ services:
     environment:
       APP_MODE: vuln
       PORT: "3000"
-      RESET_DB: "1"
+      RESET_DB: "${RESET_DB:-}"
     depends_on:
       keys:
         condition: service_completed_successfully

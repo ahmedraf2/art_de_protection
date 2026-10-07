@@ -513,6 +513,82 @@ def h_admin_users():
         return jsonify({"users": [public_user(u) for u in users]})
 
 
+def _tampered_grades(conn):
+    """Every grade whose DB value no longer matches its on-chain hash.
+
+    Raises eth_ledger.LedgerUnavailable if the node can't be reached.
+    """
+    grades = db.run(conn,
+        "SELECT g.course_id, g.student_id, g.grade, c.code, c.name AS course, "
+        "u.full_name AS student FROM grades g JOIN courses c ON c.id = g.course_id "
+        "JOIN users u ON u.id = g.student_id ORDER BY u.full_name, c.name")
+    out = []
+    for gr in grades:
+        db_hash = eth_ledger.grade_hash(gr["course_id"], gr["student_id"], gr["grade"])
+        chain_hash = eth_ledger.get_grade(gr["course_id"], gr["student_id"])
+        if db_hash != chain_hash:
+            out.append({"course_id": gr["course_id"], "student_id": gr["student_id"],
+                        "code": gr["code"], "course": gr["course"], "student": gr["student"],
+                        "db_grade": gr["grade"],
+                        "true_grade": eth_ledger.recover_grade(gr["course_id"],
+                                                               gr["student_id"], chain_hash)})
+    return out
+
+
+@app.get("/api/admin/integrity")
+@require_auth
+def h_admin_integrity():
+    """Admin tamper monitor: list grades whose DB value != the ledger."""
+    if MODE == "vuln":
+        return jsonify({"error": "no integrity ledger in this build"}), 404
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] != "admin":
+        return jsonify({"error": "admins only"}), 403
+    try:
+        return jsonify({"available": True, "alerts": _tampered_grades(conn)})
+    except eth_ledger.LedgerUnavailable as e:
+        return jsonify({"available": False, "error": str(e), "alerts": []}), 503
+
+
+@app.post("/api/admin/integrity/fix")
+@require_auth
+def h_admin_integrity_fix():
+    """Restore tampered grades to the value the issuer anchored in the contract.
+
+    With no body, fixes every tampered grade; with {course_id, student_id}, fixes
+    one. The contract holds only the hash, so the correct value is the one
+    recovered from it (eth_ledger.recover_grade). After the write the DB hash
+    matches the chain again, so the alert clears — the existing anchor is still
+    valid, so nothing new is written to the chain.
+    """
+    if MODE == "vuln":
+        return jsonify({"error": "no integrity ledger in this build"}), 404
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] != "admin":
+        return jsonify({"error": "admins only"}), 403
+    b = request.get_json(silent=True) or {}
+    only = (b.get("course_id"), b.get("student_id"))
+    try:
+        tampered = _tampered_grades(conn)
+    except eth_ledger.LedgerUnavailable as e:
+        return jsonify({"error": str(e)}), 503
+
+    restored = []
+    for a in tampered:
+        if only != (None, None) and (a["course_id"], a["student_id"]) != only:
+            continue
+        if a["true_grade"] is None:
+            continue                       # correct value couldn't be recovered
+        conn.execute("UPDATE grades SET grade = ?, updated_by = ? "
+                     "WHERE course_id = ? AND student_id = ?",
+                     (a["true_grade"], g.ident.get("sub"), a["course_id"], a["student_id"]))
+        restored.append(a)
+    conn.commit()
+    return jsonify({"ok": True, "restored": len(restored)})
+
+
 # ==========================================================================
 # Integrity ledger (GradeLedger smart contract on a local anvil node)
 # ==========================================================================

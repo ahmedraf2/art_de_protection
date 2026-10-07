@@ -8,3 +8,4 @@ contracts/cache/
 *.pdf
 *.odp
 *.png
+.anvil/

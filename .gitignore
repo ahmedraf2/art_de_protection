@@ -9,3 +9,4 @@ __pycache__/
 # foundry build output
 contracts/out/
 contracts/cache/
+.anvil/

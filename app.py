@@ -524,6 +524,13 @@ def h_blockchain():
         # VULN: this build has no integrity ledger, so nothing ever checks the
         # grades/certifications tables for tampering (vulnerability #9).
         return jsonify({"error": "no integrity ledger in this build"}), 404
+    # SECURE: the raw ledger explorer (every student's anchors, tx hashes, the
+    # contract address) is an operations/audit view, not something a student
+    # should see — restrict it to admins. Students get their own grades verified
+    # inline on the dashboard instead.
+    me = load_user(get_db(), g.ident.get("sub"))
+    if not me or me["role"] != "admin":
+        return jsonify({"error": "admins only"}), 403
     try:
         return jsonify({"mode": MODE, "available": True, **eth_ledger.info()})
     except eth_ledger.LedgerUnavailable as e:
@@ -550,9 +557,15 @@ def h_grade_integrity():
         for gr in grades:
             db_hash = eth_ledger.grade_hash(gr["course_id"], gr["student_id"], gr["grade"])
             chain_hash = eth_ledger.get_grade(gr["course_id"], gr["student_id"])
+            ok = db_hash == chain_hash
+            # The real (anchored) grade: the DB value when it checks out, else the
+            # value recovered from the on-chain hash — so the UI can show the true
+            # grade next to a tampered one.
+            true_grade = gr["grade"] if ok else \
+                eth_ledger.recover_grade(gr["course_id"], gr["student_id"], chain_hash)
             rows.append({"code": gr["code"], "name": gr["name"], "db_grade": gr["grade"],
                          "db_hash": db_hash, "chain_hash": chain_hash,
-                         "ok": db_hash == chain_hash})
+                         "ok": ok, "true_grade": true_grade})
     except eth_ledger.LedgerUnavailable as e:
         return jsonify({"available": False, "error": str(e), "rows": []}), 503
     return jsonify({"available": True, "rows": rows})

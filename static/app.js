@@ -61,7 +61,7 @@ const NAV = [
   { view: "courses", label: "Courses", icon: "📚", roles: ["student", "professor", "admin"] },
   { view: "search", label: "Directory", icon: "🔍", roles: ["student", "professor", "admin"] },
   { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student", "professor", "admin"] },
-  { view: "blockchain", label: "Blockchain", icon: "⛓️", roles: ["student", "professor", "admin"], secureOnly: true },
+  { view: "blockchain", label: "Ledger (audit)", icon: "⛓️", roles: ["admin"], secureOnly: true },
   { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor", "admin"] },
   { view: "admin", label: "Admin", icon: "⚙️", roles: ["admin"] },
 ];
@@ -114,12 +114,21 @@ VIEWS.dashboard = async function () {
   const c = $("content");
   const first = (USER.full_name || "").split(" ")[0];
   if (USER.role === "student") {
-    const [g, courses, rm, certs] = await Promise.all([
-      get("/api/my/grades"), get("/api/courses"), get("/api/messages/recent"), get("/api/certifications"),
-    ]);
-    const grades = g.grades || [];
-    const avg = grades.length
-      ? (grades.reduce((s, x) => s + parseFloat(x.grade || 0), 0) / grades.length).toFixed(2) : "—";
+    const reqs = [get("/api/my/grades"), get("/api/courses"), get("/api/messages/recent"), get("/api/certifications")];
+    if (MODE === "secure") reqs.push(get("/api/grades/integrity"));
+    const [g, courses, rm, certs, integ] = await Promise.all(reqs);
+
+    // In the secure build, verify each grade against the integrity ledger: show
+    // a tampered DB value in red next to the real (anchored) grade. The average
+    // is computed from the verified grades, so editing the DB never moves it.
+    const verified = MODE === "secure" && integ && integ.available;
+    const grades = verified
+      ? (integ.rows || []).map(r => ({ name: r.name, db: r.db_grade, real: r.true_grade, ok: r.ok }))
+      : (g.grades || []).map(x => ({ name: x.name, db: x.grade, real: x.grade, ok: true }));
+    const anyTampered = grades.some(x => x.ok === false);
+    const avgNums = grades.map(x => parseFloat((x.real != null ? x.real : x.db) || 0));
+    const avg = avgNums.length
+      ? (avgNums.reduce((s, n) => s + n, 0) / avgNums.length).toFixed(2) : "—";
     c.innerHTML = `
       <div class="page-title">Welcome back, ${esc(first)} 👋</div>
       <p class="page-sub">Here's what's happening in your account.</p>
@@ -131,9 +140,10 @@ VIEWS.dashboard = async function () {
       </div>
       <div class="grid-2 mt">
         <div class="card">
-          <h3>My grades</h3>
+          <h3>My grades ${verified ? `<span class="verified-badge">&#9939; ledger&#8209;verified</span>` : ""}</h3>
+          ${anyTampered ? `<p class="tamper-note">&#9888; A grade below does not match the integrity ledger. The value on record (verified) is shown; your average uses it.</p>` : ""}
           <table><thead><tr><th>Subject</th><th>Grade</th></tr></thead><tbody>
-          ${grades.map(x => `<tr><td>${esc(x.name)}</td><td>${gradePill(x.grade)}</td></tr>`).join("")
+          ${grades.map(x => `<tr><td>${esc(x.name)}</td><td>${gradeStatus(x)}</td></tr>`).join("")
             || `<tr><td colspan="2" class="muted">No grades yet.</td></tr>`}
           </tbody></table>
         </div>
@@ -166,6 +176,17 @@ function stat(ic, n, l) { return `<div class="stat"><span class="ic">${ic}</span
 function gradePill(v) {
   const n = parseFloat(v); const cls = n >= 14 ? "g" : n >= 10 ? "o" : "b";
   return `<span class="pill ${cls}">${esc(v)} / 20</span>`;
+}
+// A grade row that may have been tampered with: when the DB value no longer
+// matches the ledger, show it struck through in red with the verified grade.
+function gradeStatus(x) {
+  if (x.ok === false) {
+    const real = x.real != null
+      ? `<span class="grade-real">&#10004; verified ${esc(x.real)} / 20</span>`
+      : `<span class="grade-real warn">&#9888; unverified</span>`;
+    return `<span class="pill b strike">${esc(x.db)} / 20</span> ${real}`;
+  }
+  return gradePill(x.db);
 }
 function courseCard(x) {
   return `<div class="course"><div class="code">${esc(x.code)}</div><div class="name">${esc(x.name)}</div>

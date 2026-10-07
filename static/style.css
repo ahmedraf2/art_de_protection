@@ -108,6 +108,11 @@ tr:last-child td { border-bottom: none; }
 .pill.o { background: rgba(242,183,80,.15); color: var(--warn); }
 .pill.b { background: rgba(240,106,106,.15); color: var(--bad); }
 .badge-role { font-size: .72rem; padding: 2px 9px; border-radius: 20px; background: var(--panel2); border: 1px solid var(--line); color: var(--muted); }
+.pill.strike { text-decoration: line-through; opacity: .85; }
+.grade-real { margin-left: 8px; font-size: .8rem; font-weight: 600; color: var(--good); }
+.grade-real.warn { color: var(--warn); }
+.verified-badge { font-size: .7rem; font-weight: 600; color: var(--good); background: rgba(53,194,129,.12); border-radius: 20px; padding: 2px 9px; margin-left: 8px; vertical-align: middle; }
+.tamper-note { color: var(--warn); font-size: .82rem; margin: 2px 0 10px; }
 
 /* course cards */
 .course { background: var(--panel2); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }

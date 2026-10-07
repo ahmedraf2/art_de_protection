@@ -56,6 +56,27 @@ def grade_hash(course_id, student_id, grade) -> str:
     return "0x" + hashlib.sha256(payload.encode()).hexdigest()
 
 
+def recover_grade(course_id, student_id, chain_hash) -> str | None:
+    """Recover the plaintext grade anchored on-chain by matching its hash.
+
+    The contract stores only the SHA-256 hash of a grade, never the value, so
+    there is no "read the real grade from the chain" call. But grades live on a
+    small, known scale (0.00–20.00 in 0.25 steps), so the anchored value can be
+    found by hashing each candidate and comparing. This works *because* the input
+    space is tiny and the hash is unsalted — a system that needed grade
+    confidentiality would use a salted commitment instead. Returns e.g. "14.00",
+    or None if nothing matches (not anchored, or an off-scale value).
+    """
+    if not chain_hash:
+        return None
+    target = chain_hash.lower()
+    for step in range(0, 81):                      # 0.00, 0.25, …, 20.00
+        candidate = f"{step * 0.25:.2f}"
+        if grade_hash(course_id, student_id, candidate).lower() == target:
+            return candidate
+    return None
+
+
 def _b32(h: str) -> bytes:
     """'abcd…' or '0xabcd…' (64 hex digits) -> 32 raw bytes for the contract."""
     return bytes.fromhex(h[2:] if h.startswith("0x") else h)

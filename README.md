@@ -113,6 +113,7 @@ anvil keeps no state: **after restarting anvil, restart the secure build with
 | 7 | Insecure password hashing (unsalted MD5) | `auth.hash_password` |
 | 8 | Missing signature / encryption at rest | certifications & messages |
 | 9 | No integrity anchoring (grade/cert tampering undetected) | `GET /api/grades/integrity`, `GET /api/blockchain` |
+| 10 | SQL injection (people search, stacked write → grade change) | `GET /api/search` |
 
 Full exploit steps and fixes: **[VULNERABILITIES.md](VULNERABILITIES.md)**.
 Step-by-step live-demo script: **[DEMO.md](DEMO.md)**.

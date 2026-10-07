@@ -38,6 +38,27 @@ def run_raw(conn, sql):
         return []
 
 
+def run_raw_multi(conn, sql):
+    """Like run_raw, but also runs STACKED statements (';'-separated).
+
+    execute() refuses more than one statement ("You can only execute one
+    statement at a time"), which stops a classic  '; UPDATE ...; --  payload.
+    executescript() runs every statement but returns no rows. So we try the
+    normal path first (a benign search returns its matches) and fall back to
+    executescript when the input stacked extra statements — which is exactly
+    what makes a search box injectable for *writes*, not just reads.
+    """
+    try:
+        cur = conn.execute(sql)
+    except sqlite3.ProgrammingError:
+        conn.executescript(sql)      # stacked statements: run them all (data changes persist)
+        return []
+    try:
+        return [dict(r) for r in cur.fetchall()]
+    except sqlite3.ProgrammingError:
+        return []
+
+
 def run(conn, sql, params=()):
     cur = conn.execute(sql, params)
     try:

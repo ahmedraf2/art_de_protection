@@ -59,6 +59,7 @@ const NAV = [
   { view: "dashboard", label: "Dashboard", icon: "🏠", roles: ["student", "professor", "admin"] },
   { view: "chat", label: "Chat", icon: "💬", roles: ["student", "professor", "admin"] },
   { view: "courses", label: "Courses", icon: "📚", roles: ["student", "professor", "admin"] },
+  { view: "search", label: "Directory", icon: "🔍", roles: ["student", "professor", "admin"] },
   { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student", "professor", "admin"] },
   { view: "blockchain", label: "Blockchain", icon: "⛓️", roles: ["student", "professor", "admin"], secureOnly: true },
   { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor", "admin"] },
@@ -184,6 +185,31 @@ VIEWS.courses = async function () {
     <div class="page-title">Courses</div><p class="page-sub">Course catalogue</p>
     <div class="grid-3">${(d.courses || []).map(courseCard).join("")}</div>`;
 };
+
+// ---- directory (search) ----
+VIEWS.search = async function () {
+  $("content").innerHTML = `
+    <div class="page-title">Directory</div>
+    <p class="page-sub">Search students, professors and staff by name.</p>
+    <div class="card" style="max-width:640px">
+      <div style="display:flex;gap:8px">
+        <input id="dir-q" placeholder="Search by name…" style="flex:1"
+               onkeydown="if(event.key==='Enter')runSearch()" />
+        <button class="btn-primary" onclick="runSearch()">Search</button>
+      </div>
+    </div>
+    <div class="card mt"><div id="dir-results" class="muted">Type a name and hit Search.</div></div>`;
+};
+async function runSearch() {
+  const q = $("dir-q").value;
+  const d = await get("/api/search?query=" + encodeURIComponent(q));
+  const rows = d.results || [];
+  const box = $("dir-results");
+  if (!rows.length) { box.innerHTML = `<p class="muted">No matches.</p>`; return; }
+  box.innerHTML = `<table><thead><tr><th>ID</th><th>Name</th><th>Role</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.full_name)}</td>
+      <td><span class="badge-role">${esc(r.role)}</span></td></tr>`).join("")}</tbody></table>`;
+}
 
 // ---- certifications ----
 VIEWS.certifications = async function (params) {

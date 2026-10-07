@@ -196,6 +196,34 @@ def h_courses():
     return jsonify({"courses": rows})
 
 
+@app.get("/api/search")
+@require_auth
+def h_search():
+    """People directory: find users by name (any authenticated user)."""
+    conn = get_db()
+    query = request.args.get("query", "")
+
+    if MODE == "vuln":
+        # VULN: the search term is concatenated straight into SQL and run with a
+        # helper that also executes STACKED statements. A classic read works:
+        #   ?query=' UNION SELECT id, password_hash, role FROM users --
+        # but because the statement can be stacked, the search box is also a
+        # WRITE primitive — no admin login, no Gradebook access needed:
+        #   ?query=%'; UPDATE grades SET grade='20.00'
+        #           WHERE student_id=4 AND course_id=1; --
+        # changes Alice's Mathematics grade, and nothing in this build notices.
+        sql = ("SELECT id, full_name, role FROM users "
+               "WHERE full_name LIKE '%" + query + "%' ORDER BY full_name")
+        rows = db.run_raw_multi(conn, sql)
+    else:
+        # SECURE: the term is bound as a parameter (so it is only ever data, never
+        # SQL) and the query is a single statement — stacked writes are impossible.
+        rows = db.run(conn,
+            "SELECT id, full_name, role FROM users WHERE full_name LIKE ? ORDER BY full_name",
+            ("%" + query + "%",))
+    return jsonify({"results": rows})
+
+
 @app.get("/api/my/courses")
 @require_auth
 def h_my_courses():

@@ -47,7 +47,20 @@ foundryup
 cd contracts && forge build && forge test      # compile + run the 3 tests
 ```
 
-## Run
+## Run with Docker (one command)
+
+```bash
+docker compose up --build        # anvil + contract build + secure (:3001) + vuln (:3000)
+docker compose down              # stop and remove the containers
+```
+
+Every service listens on `127.0.0.1` only (`network_mode: host`, Linux). The DB
+files and `keys/` are created in this folder, so `sqlite3`, `cast` and the browser
+on your machine work exactly as in DEMO.md. Each `up` starts a fresh chain and a
+fresh database. After a DB-tamper demo, `docker compose restart secure` resets that
+build.
+
+## Run by hand
 
 ```bash
 # 1. local Ethereum node (own terminal, keep it running; listens on 127.0.0.1 only)

@@ -1,0 +1,78 @@
+# The whole lab with one command:
+#
+#     docker compose up --build        # start (Ctrl+C to stop)
+#     docker compose down              # remove the containers
+#
+#   anvil   local Ethereum node          127.0.0.1:8545
+#   forge   compiles GradeLedger.sol, then exits
+#   secure  secure build                 http://127.0.0.1:3001
+#   vuln    vulnerable build             http://127.0.0.1:3000
+#
+# network_mode: host -> every service listens on your machine's 127.0.0.1, exactly
+# as when run by hand. Nothing is reachable from the network, the app's
+# "127.0.0.1 only" rule still holds, and sqlite3 / cast / the browser on the host
+# work unchanged. (Linux only.)
+#
+# The project folder is mounted into the containers, so the databases and keys/
+# are created in this folder, owned by you (uid 1000).
+#
+# anvil keeps no state, so every `up` starts a fresh chain and both apps start
+# with RESET_DB=1 (fresh DB, fresh contract, seed data re-anchored).
+
+x-app: &app
+  build: .
+  image: campus-portal
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  network_mode: host
+  working_dir: /app
+  volumes:
+    - ./:/app
+
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    network_mode: host
+    entrypoint: ["anvil", "--host", "127.0.0.1", "--port", "8545", "--chain-id", "31337"]
+    healthcheck:
+      test: ["CMD-SHELL", "cast chain-id --rpc-url http://127.0.0.1:8545"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  forge:
+    image: ghcr.io/foundry-rs/foundry:latest
+    network_mode: host
+    working_dir: /contracts
+    volumes:
+      - ./contracts:/contracts
+    entrypoint: ["forge", "build"]
+
+  secure:
+    <<: *app
+    environment:
+      APP_MODE: secure
+      PORT: "3001"
+      RESET_DB: "1"
+    depends_on:
+      anvil:
+        condition: service_healthy
+        restart: true            # `docker compose restart anvil` also restarts this app
+      forge:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3001/api/config')"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  vuln:
+    <<: *app
+    environment:
+      APP_MODE: vuln
+      PORT: "3000"
+      RESET_DB: "1"
+    depends_on:
+      # Start after the secure app: on the very first run both would otherwise
+      # create the shared keys in keys/ at the same time.
+      secure:
+        condition: service_healthy

@@ -1,0 +1,10 @@
+# Keep secrets and generated files out of the image build context.
+keys/
+*.db
+.git/
+__pycache__/
+contracts/out/
+contracts/cache/
+*.pdf
+*.odp
+*.png

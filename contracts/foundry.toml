@@ -5,3 +5,6 @@ out = "out"
 libs = []
 solc_version = "0.8.28"
 evm_version = "cancun"
+
+[lint]
+lint_on_build = false     # skip style notes during build (run `forge lint` to see them)

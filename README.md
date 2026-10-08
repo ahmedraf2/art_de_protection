@@ -20,14 +20,15 @@ build, then switch to the secure build and confirm the same request now fails.
 
 | Role | Can do |
 |------|--------|
-| **Student** | see own courses, grades and certifications; send/read messages |
-| **Professor** | see own courses and students; enter grades; messages |
-| **Admin** | manage all users; issue (sign) certifications; full messaging |
+| **Student** | see own courses/grades/certifications; request documents; messaging; announcements |
+| **Professor** | grade own courses; issue (sign) certificates to enrolled students; messaging; post announcements |
+| **Admin** | manage all users; approve document requests; monitor/restore tampered grades; post announcements |
 
-Cross-cutting: JWT login, private messaging, digitally-signed certifications,
-encrypted message storage, and a blockchain integrity ledger — a Solidity smart
-contract on a local Ethereum node — that anchors grades and certifications
-(secure build).
+Cross-cutting: JWT login, password reset, editable profile, a campus announcements
+feed, administrative document requests, private messaging, digitally-signed
+certifications, encrypted message storage, and a blockchain integrity ledger — a
+Solidity smart contract on a local Ethereum node — that anchors grades and
+certifications and powers the admin tamper monitor (secure build).
 
 ## Requirements
 
@@ -114,6 +115,10 @@ anvil keeps no state: **after restarting anvil, restart the secure build with
 | 8 | Missing signature / encryption at rest | certifications & messages |
 | 9 | No integrity anchoring (grade/cert tampering undetected) | `GET /api/grades/integrity`, `GET /api/blockchain` |
 | 10 | SQL injection (people search, stacked write → grade change) | `GET /api/search` |
+| 11 | Stored XSS (announcements feed) | `POST /api/announcements` + client render |
+| 12 | IDOR — read any student's document | `GET /api/documents/<id>` |
+| 13 | Mass assignment (profile update sets `role`) | `POST /api/profile` |
+| 14 | Predictable password-reset token | `POST /api/password-reset/{request,confirm}` |
 
 Full exploit steps and fixes: **[VULNERABILITIES.md](VULNERABILITIES.md)**.
 Step-by-step live-demo script: **[DEMO.md](DEMO.md)**.

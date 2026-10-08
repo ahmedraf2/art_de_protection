@@ -1,4 +1,4 @@
-// Campus Portal — front-end SPA.
+// Meridian University — Student Portal front-end SPA.
 // The auth token is kept in localStorage and sent as a Bearer header, like a
 // typical single-page app. Views are rendered from the URL hash, so the chat
 // conversation URL (…#chat?chat_users[0]=..&chat_users[1]=..) is visible and
@@ -6,6 +6,28 @@
 
 let USER = null;
 let MODE = "vuln";      // build reported by /api/config ("vuln" | "secure")
+
+// ---------------- branding ----------------
+const ORG_NAME = "Meridian University";
+const ACADEMIC_YEAR = "2025 / 2026";
+const DOC_TYPES = ["Attestation d'inscription", "Relevé de notes", "Attestation de réussite"];
+const LOGO_SVG = `<svg class="logo" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M16 3 4 8v8c0 7 5 11.3 12 13 7-1.7 12-6 12-13V8L16 3Z" fill="var(--accent)"/>
+  <text x="16" y="21.5" text-anchor="middle" font-size="14" font-weight="800" fill="#fff"
+        font-family="Segoe UI, system-ui, sans-serif">M</text></svg>`;
+
+function brandMarkup(sub) {
+  return `${LOGO_SVG}<span class="brand-text"><span class="brand-org">${ORG_NAME}</span>` +
+         (sub ? `<span class="brand-sub">${sub}</span>` : "") + `</span>`;
+}
+function applyBranding() {
+  ["brand-login", "brand-register", "brand-reset", "brand-top"].forEach(id => {
+    const el = $(id); if (el) el.innerHTML = brandMarkup("Student Portal");
+  });
+  const yp = $("year-pill"); if (yp) yp.textContent = ACADEMIC_YEAR;
+  const footText = `© ${new Date().getFullYear()} ${ORG_NAME} · Student Portal · Academic year ${ACADEMIC_YEAR}`;
+  ["foot-login", "app-footer"].forEach(id => { const el = $(id); if (el) el.textContent = footText; });
+}
 
 function token() { return localStorage.getItem("token") || ""; }
 function setToken(t) { localStorage.setItem("token", t); }
@@ -21,14 +43,39 @@ async function api(method, path, body) {
   const opts = { method, headers: h };
   if (body !== undefined) { h["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
   const res = await fetch(path, opts);
+  // Session expiry: if a request with a token comes back 401, the token is
+  // invalid or expired — send the user back to login instead of silently
+  // breaking the view. (The public auth endpoints never carry a token.)
+  if (res.status === 401 && token() &&
+      !path.startsWith("/api/login") && !path.startsWith("/api/register")) {
+    sessionExpired();
+    return { status: 401, data: { error: "session expired" } };
+  }
   let data; try { data = await res.json(); } catch { data = {}; }
   return { status: res.status, data };
 }
 const get = async (p) => (await api("GET", p)).data;
 
+function sessionExpired() {
+  if (!token()) return;
+  clearToken(); USER = null;
+  clearInterval(_integrityTimer);
+  $("app").classList.add("hidden");
+  showLogin();
+  const e = $("li-error");
+  if (e) e.textContent = "Your session has expired. Please sign in again.";
+}
+
 // ---------------- auth screens ----------------
-function showLogin() { $("register-screen").classList.add("hidden"); $("login-screen").classList.remove("hidden"); }
-function showRegister() { $("login-screen").classList.add("hidden"); $("register-screen").classList.remove("hidden"); }
+function hideAuthScreens() {
+  ["login-screen", "register-screen", "reset-screen"].forEach(id => $(id).classList.add("hidden"));
+}
+function showLogin() { hideAuthScreens(); $("login-screen").classList.remove("hidden"); }
+function showRegister() { hideAuthScreens(); $("register-screen").classList.remove("hidden"); }
+function showReset() {
+  hideAuthScreens(); $("reset-screen").classList.remove("hidden");
+  $("rs-token-box").classList.add("hidden"); $("rs-msg").textContent = "";
+}
 
 async function doLogin() {
   $("li-error").textContent = "";
@@ -46,10 +93,31 @@ async function doRegister() {
     username: $("rg-user").value,
     email: $("rg-email").value,
     password: $("rg-pass").value,
-    // account type is fixed to student in the UI
+    // The role is assigned by the server (secure) — the UI never sends one.
   });
   if (status === 201) { alert("Account created. You can sign in now."); showLogin(); }
   else $("rg-error").textContent = data.error || "Registration failed";
+}
+
+// ---- password reset ----
+async function requestReset() {
+  const { data } = await api("POST", "/api/password-reset/request", { username: $("rs-user").value });
+  $("rs-token-box").classList.remove("hidden");
+  const m = $("rs-msg"); m.style.color = "var(--muted)";
+  if (data.reset_token) {        // vuln build returns the token directly
+    $("rs-token").value = data.reset_token;
+    m.textContent = "Demo token issued (shown here for the lab): " + data.reset_token;
+  } else {
+    m.textContent = data.message || "If the account exists, a token was issued (see the server log).";
+  }
+}
+async function confirmReset() {
+  const { status, data } = await api("POST", "/api/password-reset/confirm", {
+    token: $("rs-token").value, new_password: $("rs-new").value,
+  });
+  const m = $("rs-msg");
+  if (status === 200) { m.style.color = "var(--good)"; m.textContent = "Password reset. You can sign in now."; setTimeout(showLogin, 1200); }
+  else { m.style.color = "var(--bad)"; m.textContent = data.error || "Reset failed"; }
 }
 
 function doLogout() { clearToken(); USER = null; location.hash = ""; location.reload(); }
@@ -57,10 +125,12 @@ function doLogout() { clearToken(); USER = null; location.hash = ""; location.re
 // ---------------- app shell ----------------
 const NAV = [
   { view: "dashboard", label: "Dashboard", icon: "🏠", roles: ["student", "professor", "admin"] },
+  { view: "announcements", label: "Announcements", icon: "📢", roles: ["student", "professor", "admin"] },
   { view: "chat", label: "Chat", icon: "💬", roles: ["student", "professor", "admin"] },
   { view: "courses", label: "Courses", icon: "📚", roles: ["student", "professor", "admin"] },
   { view: "search", label: "Directory", icon: "🔍", roles: ["student", "professor", "admin"] },
   { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student"] },
+  { view: "documents", label: "Documents", icon: "📄", roles: ["student", "admin"] },
   { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor"] },
   { view: "certify", label: "Certify", icon: "🎓", roles: ["professor"] },
   { view: "users", label: "Users", icon: "👥", roles: ["admin"] },
@@ -72,13 +142,11 @@ async function enterApp() {
   if (status !== 200) { showLogin(); return; }
   USER = data.user;
   MODE = (await get("/api/config")).mode || "vuln";
-  $("login-screen").classList.add("hidden");
-  $("register-screen").classList.add("hidden");
+  hideAuthScreens();
   $("app").classList.remove("hidden");
   $("tb-name").textContent = USER.full_name;
   $("avatar").textContent = initials(USER.full_name);
 
-  // the vuln build has no integrity ledger, so it has no Blockchain page
   $("sidebar").innerHTML = NAV.filter(n => n.roles.includes(USER.role) && !(n.secureOnly && MODE !== "secure"))
     .map(n => `<button data-view="${n.view}" onclick="nav('${n.view}')"><span>${n.icon}</span> ${n.label}</button>`).join("");
 
@@ -139,9 +207,10 @@ VIEWS.dashboard = async function () {
   const c = $("content");
   const first = (USER.full_name || "").split(" ")[0];
   if (USER.role === "student") {
-    const reqs = [get("/api/my/grades"), get("/api/courses"), get("/api/messages/recent"), get("/api/certifications")];
+    const reqs = [get("/api/my/grades"), get("/api/my/courses"), get("/api/messages/recent"),
+                  get("/api/certifications"), get("/api/announcements")];
     if (MODE === "secure") reqs.push(get("/api/grades/integrity"));
-    const [g, courses, rm, certs, integ] = await Promise.all(reqs);
+    const [g, mc, rm, certs, ann, integ] = await Promise.all(reqs);
 
     // In the secure build, verify each grade against the integrity ledger: show
     // a tampered DB value in red next to the real (anchored) grade. The average
@@ -178,22 +247,25 @@ VIEWS.dashboard = async function () {
           <button class="btn-ghost mt" onclick="nav('chat')">View all messages</button>
         </div>
       </div>
-      <div class="card mt"><h3>Available courses</h3>
-        <div class="grid-3 mt">${(courses.courses || []).map(courseCard).join("")}</div>
+      ${announceWidget(ann.announcements || [])}
+      <div class="card mt"><h3>My courses</h3>
+        <div class="grid-3 mt">${(mc.courses || []).map(enrolledCard).join("")
+          || `<p class="muted">You are not enrolled in any courses yet.</p>`}</div>
       </div>`;
   } else {
-    const [mc, rm] = await Promise.all([get("/api/my/courses"), get("/api/messages/recent")]);
+    const [mc, rm, ann] = await Promise.all([get("/api/my/courses"), get("/api/messages/recent"),
+                                             get("/api/announcements")]);
     c.innerHTML = `
       <div class="page-title">Welcome back, ${esc(first)} 👋</div>
       <p class="page-sub">${USER.role === "admin" ? "Administrator dashboard." : "Professor dashboard."}</p>
       <div class="grid-2">
         <div class="card"><h3>${USER.role === "admin" ? "All courses" : "My courses"}</h3>
-          <div class="grid-2 mt">${(mc.courses || []).map(x =>
-            `<div class="course"><div class="code">${esc(x.code)}</div><div class="name">${esc(x.name)}</div><div class="muted">id: ${x.id}</div></div>`).join("")}</div>
+          <div class="grid-2 mt">${(mc.courses || []).map(enrolledCard).join("")}</div>
         </div>
         <div class="card"><h3>Recent messages</h3>${recentList(rm.messages || [])}
           <button class="btn-ghost mt" onclick="nav('chat')">View all messages</button></div>
-      </div>`;
+      </div>
+      ${announceWidget(ann.announcements || [])}`;
   }
 };
 
@@ -217,11 +289,25 @@ function courseCard(x) {
   return `<div class="course"><div class="code">${esc(x.code)}</div><div class="name">${esc(x.name)}</div>
           <div class="muted">${esc(x.professor || "—")}</div></div>`;
 }
+function enrolledCard(x) {
+  return `<div class="course"><div class="code">${esc(x.code)}</div><div class="name">${esc(x.name)}</div></div>`;
+}
 function recentList(msgs) {
   if (!msgs.length) return `<p class="muted">No messages.</p>`;
   return msgs.map(m => `<div class="rmsg"><div class="dot"></div><div>
     <div class="who">${m.outgoing ? "To " : ""}${esc(m.with)}</div>
     <div class="snip">${esc(m.body)}</div></div></div>`).join("");
+}
+// A compact "latest news" card for the dashboard. Bodies render through
+// announceBody(), so the stored-XSS pair (#11) also applies here in the vuln build.
+function announceWidget(items) {
+  if (!items.length) return "";
+  const top = items.slice(0, 3).map(a => `
+    <div class="rmsg"><div class="dot"></div><div style="min-width:0">
+      <div class="who">${esc(a.title)} <span class="muted" style="font-weight:400">· ${esc(fmtDate(a.created_at))}</span></div>
+      <div class="snip" style="max-width:none">${announceBody(a.body)}</div></div></div>`).join("");
+  return `<div class="card mt"><h3>Latest announcements</h3>${top}
+    <button class="btn-ghost mt" onclick="nav('announcements')">View all announcements</button></div>`;
 }
 
 // ---- courses ----
@@ -231,6 +317,54 @@ VIEWS.courses = async function () {
     <div class="page-title">Courses</div><p class="page-sub">Course catalogue</p>
     <div class="grid-3">${(d.courses || []).map(courseCard).join("")}</div>`;
 };
+
+// ---- announcements (campus news feed) ----
+VIEWS.announcements = async function () {
+  const d = await get("/api/announcements");
+  const canPost = USER.role === "professor" || USER.role === "admin";
+  $("content").innerHTML = `
+    <div class="page-title">Announcements</div>
+    <p class="page-sub">News from the administration and your professors.</p>
+    ${canPost ? `<div class="card" style="max-width:660px">
+      <label>Title</label><input id="an-title" placeholder="Announcement title" />
+      <label>Message</label><textarea id="an-body" rows="3" placeholder="Write an announcement…"></textarea>
+      <div id="an-msg" class="form-error"></div>
+      <button class="btn-primary btn-block" onclick="postAnnouncement()">Publish</button>
+    </div>` : ""}
+    <div id="an-feed" class="mt"></div>`;
+  renderAnnouncements(d.announcements || []);
+};
+function renderAnnouncements(items) {
+  const feed = $("an-feed");
+  if (!feed) return;
+  if (!items.length) { feed.innerHTML = `<p class="muted">No announcements yet.</p>`; return; }
+  feed.innerHTML = items.map(a => `
+    <div class="card announce">
+      <div class="announce-head">
+        <h3>${esc(a.title)}</h3>
+        <span class="muted">${esc(fmtDate(a.created_at))}</span>
+      </div>
+      <div class="announce-meta">${esc(a.author || "Staff")}
+        <span class="badge-role">${esc(a.author_role || "")}</span></div>
+      <div class="announce-body">${announceBody(a.body)}</div>
+    </div>`).join("");
+}
+// VULN (#11 stored XSS): the vuln build injects the announcement body as RAW HTML,
+// so a <script>/<img onerror=…> saved by any staff account (or by a student who
+// escalated via #5/#13) runs in every reader's browser, including the admin's.
+// SECURE: the body is HTML-escaped on output (output encoding) and renders inert.
+function announceBody(body) {
+  return MODE === "secure" ? esc(body) : (body || "");
+}
+async function postAnnouncement() {
+  const { status, data } = await api("POST", "/api/announcements", {
+    title: $("an-title").value, body: $("an-body").value,
+  });
+  const m = $("an-msg");
+  m.style.color = status === 201 ? "var(--good)" : "var(--bad)";
+  m.textContent = status === 201 ? "Published." : (data.error || "Failed");
+  if (status === 201) VIEWS.announcements();
+}
 
 // ---- directory (search) ----
 VIEWS.search = async function () {
@@ -252,8 +386,8 @@ async function runSearch() {
   const rows = d.results || [];
   const box = $("dir-results");
   if (!rows.length) { box.innerHTML = `<p class="muted">No matches.</p>`; return; }
-  box.innerHTML = `<table><thead><tr><th>ID</th><th>Name</th><th>Role</th></tr></thead>
-    <tbody>${rows.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.full_name)}</td>
+  box.innerHTML = `<table><thead><tr><th>Name</th><th>Role</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td>${esc(r.full_name)}</td>
       <td><span class="badge-role">${esc(r.role)}</span></td></tr>`).join("")}</tbody></table>`;
 }
 
@@ -278,6 +412,94 @@ VIEWS.certifications = async function (params) {
     <div class="card"><table><thead><tr><th>Student</th><th>Title</th><th>Grade</th><th>Issued</th><th>Signature</th>${ledger ? "<th>Ledger</th>" : ""}</tr></thead>
     <tbody>${rows || `<tr><td colspan="6" class="muted">No certifications.</td></tr>`}</tbody></table></div>`;
 };
+
+// ---- documents (students request; admin approves; IDOR on viewing #12) ----
+VIEWS.documents = async function (params) {
+  const docId = params.get("doc");
+  if (docId) return renderDocument(docId);
+  if (USER.role === "admin") return renderAdminDocuments();
+  return renderMyDocuments();
+};
+function docStatus(s) {
+  const cls = s === "approved" ? "g" : s === "rejected" ? "b" : "o";
+  return `<span class="pill ${cls}">${esc(s)}</span>`;
+}
+async function renderMyDocuments() {
+  const d = await get("/api/my/documents");
+  const rows = (d.documents || []).map(x => `
+    <tr><td>${esc(x.reference || ("#" + x.id))}</td><td>${esc(x.doc_type)}</td>
+      <td>${docStatus(x.status)}</td><td>${esc(fmtDate(x.created_at))}</td>
+      <td>${x.status === "approved"
+        ? `<button class="btn-ghost sm" onclick="nav('documents?doc=${x.id}')">View</button>` : ""}</td></tr>`).join("");
+  $("content").innerHTML = `
+    <div class="page-title">Documents</div>
+    <p class="page-sub">Request official documents from the registrar's office.</p>
+    <div class="card" style="max-width:520px">
+      <label>Document type</label>
+      <select id="doc-type">${DOC_TYPES.map(t => `<option>${esc(t)}</option>`).join("")}</select>
+      <div id="doc-msg" class="form-error"></div>
+      <button class="btn-primary btn-block" onclick="requestDocument()">Submit request</button>
+    </div>
+    <div class="card mt"><h3>My requests</h3>
+      <table><thead><tr><th>Reference</th><th>Type</th><th>Status</th><th>Requested</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="5" class="muted">No requests yet.</td></tr>`}</tbody></table></div>`;
+}
+async function requestDocument() {
+  const { status, data } = await api("POST", "/api/documents", { doc_type: $("doc-type").value });
+  const m = $("doc-msg");
+  m.style.color = status === 201 ? "var(--good)" : "var(--bad)";
+  m.textContent = status === 201 ? "Request submitted." : (data.error || "Failed");
+  if (status === 201) renderMyDocuments();
+}
+async function renderAdminDocuments() {
+  const d = await get("/api/admin/documents");
+  const rows = (d.documents || []).map(x => `
+    <tr><td>${esc(x.reference || ("#" + x.id))}</td><td>${esc(x.student)}</td><td>${esc(x.doc_type)}</td>
+      <td>${docStatus(x.status)}</td><td>${esc(fmtDate(x.created_at))}</td>
+      <td>${x.status === "pending"
+        ? `<button class="btn-primary sm" onclick="decideDoc(${x.id},'approved')">Approve</button>
+           <button class="btn-ghost sm" onclick="decideDoc(${x.id},'rejected')">Reject</button>`
+        : `<button class="btn-ghost sm" onclick="nav('documents?doc=${x.id}')">View</button>`}</td></tr>`).join("");
+  $("content").innerHTML = `
+    <div class="page-title">Document requests</div>
+    <p class="page-sub">Approve or reject student document requests.</p>
+    <div class="card"><table><thead><tr><th>Reference</th><th>Student</th><th>Type</th><th>Status</th><th>Requested</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6" class="muted">No requests.</td></tr>`}</tbody></table></div>`;
+}
+async function decideDoc(id, decision) {
+  const { status, data } = await api("POST", `/api/admin/documents/${id}/decide`, { decision });
+  if (status !== 200) { alert((data && data.error) || "Failed"); return; }
+  renderAdminDocuments();
+}
+async function renderDocument(id) {
+  const { status, data } = await api("GET", "/api/documents/" + encodeURIComponent(id));
+  const c = $("content");
+  const back = `<button class="btn-ghost" onclick="nav('documents')">← Back</button>`;
+  if (status !== 200) {
+    c.innerHTML = `<div class="chat-head"><div class="page-title">Document</div>${back}</div>
+      <div class="card"><p class="pill b">${esc((data && data.error) || "Error")}</p></div>`;
+    return;
+  }
+  const d = data.document;
+  c.innerHTML = `<div class="chat-head"><div class="page-title">Document</div>${back}</div>
+    ${d.status === "approved" ? attestation(d)
+      : `<div class="card"><p class="muted">This document is <b>${esc(d.status)}</b> and cannot be viewed yet.</p></div>`}`;
+}
+function attestation(d) {
+  return `<div class="card attestation">
+    <div class="att-head">${LOGO_SVG}
+      <div><div class="att-org">${ORG_NAME}</div><div class="muted">Office of the Registrar</div></div></div>
+    <h2 class="att-title">${esc(d.doc_type)}</h2>
+    <p>This is to certify that <b>${esc(d.student)}</b> is a registered student at
+       ${ORG_NAME} for the ${ACADEMIC_YEAR} academic year.</p>
+    <div class="att-grid">
+      <div><span class="k">Reference</span>${esc(d.reference || ("#" + d.id))}</div>
+      <div><span class="k">Issued</span>${esc(fmtDate(d.decided_at || d.created_at))}</div>
+      <div><span class="k">Student e-mail</span>${esc(d.student_email || "—")}</div>
+    </div>
+    <p class="att-foot muted">Generated by the ${ORG_NAME} Student Portal.
+       Verify authenticity at the registrar's office.</p></div>`;
+}
 
 // ---- on-chain audit log (rendered inside the admin Integrity page) ----
 function shortHash(h) { return h ? h.slice(0, 10) + "…" + h.slice(-6) : ""; }
@@ -374,7 +596,7 @@ function fillStudents(prefix) {
   const course = ROSTER.find(c => c.course_id === Number($(prefix + "-course").value));
   const students = course ? course.students : [];
   $(prefix + "-student").innerHTML = students.length
-    ? students.map(s => `<option value="${s.id}">${esc(s.full_name)} (id ${s.id})</option>`).join("")
+    ? students.map(s => `<option value="${s.id}">${esc(s.full_name)}</option>`).join("")
     : `<option value="">— no enrolled students —</option>`;
 }
 
@@ -409,7 +631,7 @@ async function saveGrade() {
   });
   $("gb-msg").style.color = status === 200 ? "var(--good)" : "var(--bad)";
   $("gb-msg").textContent = status === 200 ? "Saved." : (data.error || "Failed");
-};
+}
 
 // ---- users (admin: account list only) ----
 VIEWS.users = async function () {
@@ -419,9 +641,15 @@ VIEWS.users = async function () {
   const d = await get("/api/admin/users");
   const box = $("admin-users");
   if (!d.users) { box.innerHTML = `<span class="pill b">${esc(d.error || "error")}</span>`; return; }
-  const cols = Object.keys(d.users[0]);
-  box.innerHTML = `<table><thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead>
-    <tbody>${d.users.map(u => `<tr>${cols.map(c => `<td>${esc(u[c])}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  // A realistic portal shows a clean account list — name, username, email, phone,
+  // role. (The vuln build STILL leaks password_hash in the API response; you find
+  // it in the Network tab / Burp, not on this screen.)
+  const COLS = [["full_name", "Name"], ["username", "Username"], ["email", "Email"],
+                ["phone", "Phone"], ["role", "Role"]];
+  box.innerHTML = `<table><thead><tr>${COLS.map(c => `<th>${c[1]}</th>`).join("")}</tr></thead>
+    <tbody>${d.users.map(u => `<tr>${COLS.map(c =>
+      c[0] === "role" ? `<td><span class="badge-role">${esc(u.role)}</span></td>`
+                      : `<td>${esc(u[c[0]] || "—")}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 };
 
 // ---- certify (professors: issue a signed certificate to an enrolled student) ----
@@ -534,22 +762,56 @@ async function fixGrade(course_id, student_id) {
   checkIntegrityBadge();           // refresh the sidebar badge
 }
 
-// ---- profile ----
+// ---- profile (editable + change password) ----
 VIEWS.profile = async function () {
   const u = USER;
   $("content").innerHTML = `
     <div class="page-title">Profile</div><p class="page-sub">Your account details</p>
-    <div class="card" style="max-width:520px">
-      <div style="display:flex;align-items:center;gap:16px;margin-bottom:10px">
+    <div class="card" style="max-width:560px">
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:14px">
         <div class="avatar" style="width:56px;height:56px;font-size:1.2rem">${initials(u.full_name)}</div>
         <div><div style="font-size:1.2rem;font-weight:700">${esc(u.full_name)}</div>
-        <div class="muted">${esc(u.username)}</div></div>
+        <div class="muted">${esc(u.username)} · <span class="badge-role">${esc(u.role)}</span></div></div>
       </div>
-      <div class="profile-row"><span class="k">User ID</span><span>${u.id}</span></div>
-      <div class="profile-row"><span class="k">Email</span><span>${esc(u.email || "—")}</span></div>
-      <div class="profile-row"><span class="k">Role</span><span class="badge-role">${esc(u.role)}</span></div>
+      <label>Full name</label><input id="pf-name" value="${esc(u.full_name || "")}" />
+      <label>Email</label><input id="pf-email" value="${esc(u.email || "")}" />
+      <label>Phone</label><input id="pf-phone" value="${esc(u.phone || "")}" />
+      <label>Address</label><input id="pf-address" value="${esc(u.address || "")}" />
+      <div id="pf-msg" class="form-error"></div>
+      <button class="btn-primary btn-block" onclick="saveProfile()">Save changes</button>
+    </div>
+    <div class="card mt" style="max-width:560px">
+      <h3>Change password</h3>
+      <label>Current password</label><input id="pf-old" type="password" />
+      <label>New password</label><input id="pf-new" type="password" />
+      <div id="pf-pwmsg" class="form-error"></div>
+      <button class="btn-ghost btn-block" onclick="changePassword()">Update password</button>
     </div>`;
 };
+async function saveProfile() {
+  const { status, data } = await api("POST", "/api/profile", {
+    full_name: $("pf-name").value, email: $("pf-email").value,
+    phone: $("pf-phone").value, address: $("pf-address").value,
+  });
+  const m = $("pf-msg");
+  m.style.color = status === 200 ? "var(--good)" : "var(--bad)";
+  if (status === 200) {
+    USER = data.user;
+    $("tb-name").textContent = USER.full_name;
+    $("avatar").textContent = initials(USER.full_name);
+    m.textContent = "Saved.";
+  } else m.textContent = data.error || "Failed";
+}
+async function changePassword() {
+  const { status, data } = await api("POST", "/api/change-password", {
+    old_password: $("pf-old").value, new_password: $("pf-new").value,
+  });
+  const m = $("pf-pwmsg");
+  m.style.color = status === 200 ? "var(--good)" : "var(--bad)";
+  m.textContent = status === 200 ? "Password updated." : (data.error || "Failed");
+  if (status === 200) { $("pf-old").value = ""; $("pf-new").value = ""; }
+}
 
 // ---------------- boot ----------------
+applyBranding();
 if (token()) enterApp(); else showLogin();

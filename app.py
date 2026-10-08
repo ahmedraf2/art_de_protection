@@ -13,6 +13,8 @@ Vulnerable branches are marked  # VULN:  and their fixes  # SECURE:.
 """
 
 import os
+import hashlib
+import secrets
 import functools
 from datetime import date
 
@@ -78,7 +80,8 @@ def require_auth(fn):
 
 def public_user(u, include_secrets=False):
     out = {"id": u["id"], "username": u["username"], "full_name": u["full_name"],
-           "email": u["email"], "role": u["role"]}
+           "email": u["email"], "role": u["role"],
+           "phone": u["phone"], "address": u["address"]}
     if include_secrets:
         out["password_hash"] = u["password_hash"]
         out["hash_scheme"] = u["hash_scheme"]
@@ -382,6 +385,18 @@ def h_issue_cert():
     gr = db.run(conn, "SELECT grade FROM grades WHERE course_id = ? AND student_id = ?",
                 (course["id"], student["id"]))
     grade = gr[0]["grade"] if gr else "Completed"
+    # SECURE: honour the certificate's grade requirement. The vuln build ignores
+    # this, so an "Honors Distinction" can be minted for a failing grade.
+    min_grade = db.CERT_MIN_GRADE.get(cert_type)
+    if min_grade is not None:
+        try:
+            gval = float(grade)
+        except (TypeError, ValueError):
+            return jsonify({"error": f"'{cert_type}' requires a recorded grade of at "
+                                     f"least {min_grade:g}/20"}), 400
+        if gval < min_grade:
+            return jsonify({"error": f"'{cert_type}' requires at least {min_grade:g}/20 "
+                                     f"(student has {grade}/20)"}), 400
     issued = b.get("issued_date") or date.today().isoformat()
     sig = cu.sign_cert(student["id"], title, grade, issued)   # SECURE: signed
     cur = conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
@@ -416,8 +431,17 @@ def h_set_grade():
         if not (me["role"] == "admin" or
                 (me["role"] == "professor" and course[0]["professor_id"] == me["id"])):
             return jsonify({"error": "not authorized to grade this course"}), 403
+        # SECURE: validate the grade is a number on the 0–20 scale. The vuln build
+        # accepts anything ("abc", "25", "-5") with no validation at all.
+        try:
+            gval = float(grade)
+        except (TypeError, ValueError):
+            return jsonify({"error": "grade must be a number between 0 and 20"}), 400
+        if not 0 <= gval <= 20:
+            return jsonify({"error": "grade must be between 0 and 20"}), 400
+        grade = f"{gval:.2f}"
     # VULN: no authorization check — any logged-in user (a student!) can set any
-    # grade for any student, including their own.
+    # grade for any student, including their own — and no validation of the value.
 
     existing = db.run(conn, "SELECT id FROM grades WHERE course_id = ? AND student_id = ?",
                       (course_id, student_id))
@@ -715,6 +739,257 @@ def h_grade_integrity():
     except eth_ledger.LedgerUnavailable as e:
         return jsonify({"available": False, "error": str(e), "rows": []}), 503
     return jsonify({"available": True, "rows": rows})
+
+
+# ==========================================================================
+# Announcements (campus news feed)  —  stored-XSS pair (#11)
+# ==========================================================================
+@app.get("/api/announcements")
+@require_auth
+def h_announcements():
+    rows = db.run(get_db(),
+        "SELECT a.id, a.title, a.body, a.created_at, u.full_name AS author, "
+        "u.role AS author_role FROM announcements a "
+        "LEFT JOIN users u ON u.id = a.author_id ORDER BY a.id DESC")
+    return jsonify({"announcements": rows})
+
+
+@app.post("/api/announcements")
+@require_auth
+def h_post_announcement():
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    # Only staff may post to the campus feed (same rule in both builds).
+    if not me or me["role"] not in ("professor", "admin"):
+        return jsonify({"error": "only staff may post announcements"}), 403
+    b = request.get_json(silent=True) or {}
+    title = (b.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "a title is required"}), 400
+    # The body is stored exactly as submitted in BOTH builds. The vuln/secure
+    # difference is how the browser RENDERS it (see announceBody() in app.js):
+    #   VULN   #11: the body is injected as raw HTML, so <script>/<img onerror>
+    #               stored here runs in every reader's browser (stored XSS).
+    #   SECURE:     the body is HTML-escaped on output (output encoding).
+    # Storing the raw text is realistic — encoding is an output-time concern.
+    conn.execute("INSERT INTO announcements (author_id, title, body) VALUES (?,?,?)",
+                 (me["id"], title, b.get("body") or ""))
+    conn.commit()
+    return jsonify({"ok": True}), 201
+
+
+# ==========================================================================
+# Administrative documents  —  IDOR pair (#12)
+# ==========================================================================
+@app.post("/api/documents")
+@require_auth
+def h_request_document():
+    """A student requests an official document about themselves."""
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    b = request.get_json(silent=True) or {}
+    doc_type = b.get("doc_type")
+    if doc_type not in db.DOC_TYPES:
+        return jsonify({"error": "unknown document type"}), 400
+    cur = conn.execute("INSERT INTO documents (student_id, doc_type) VALUES (?,?)",
+                       (me["id"], doc_type))
+    conn.execute("UPDATE documents SET reference = ? WHERE id = ?",
+                 (f"DOC-{date.today().year}-{cur.lastrowid:04d}", cur.lastrowid))
+    conn.commit()
+    return jsonify({"ok": True, "id": cur.lastrowid}), 201
+
+
+@app.get("/api/my/documents")
+@require_auth
+def h_my_documents():
+    rows = db.run(get_db(),
+        "SELECT id, doc_type, status, reference, created_at, decided_at "
+        "FROM documents WHERE student_id = ? ORDER BY id DESC", (g.ident.get("sub"),))
+    return jsonify({"documents": rows})
+
+
+@app.get("/api/documents/<int:doc_id>")
+@require_auth
+def h_get_document(doc_id):
+    conn = get_db()
+    rows = db.run(conn,
+        "SELECT d.*, u.full_name AS student, u.email AS student_email "
+        "FROM documents d JOIN users u ON u.id = d.student_id WHERE d.id = ?", (doc_id,))
+    if not rows:
+        return jsonify({"error": "document not found"}), 404
+    doc = rows[0]
+    if MODE == "secure":
+        # SECURE: a student may read only their OWN document; staff/admin read any.
+        me = load_user(conn, g.ident.get("sub"))
+        if me["role"] == "student" and doc["student_id"] != me["id"]:
+            return jsonify({"error": "forbidden"}), 403
+    # VULN (IDOR #12): no ownership check — a student can walk /api/documents/<id>
+    # (the ids appear in their own request list) and read any other student's
+    # attestation / transcript, including name, email and reference number.
+    return jsonify({"document": doc})
+
+
+@app.get("/api/admin/documents")
+@require_auth
+def h_admin_documents():
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] != "admin":
+        return jsonify({"error": "admins only"}), 403
+    rows = db.run(conn,
+        "SELECT d.id, d.doc_type, d.status, d.reference, d.created_at, d.decided_at, "
+        "u.full_name AS student FROM documents d JOIN users u ON u.id = d.student_id "
+        "ORDER BY (d.status = 'pending') DESC, d.id DESC")
+    return jsonify({"documents": rows})
+
+
+@app.post("/api/admin/documents/<int:doc_id>/decide")
+@require_auth
+def h_decide_document(doc_id):
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] != "admin":
+        return jsonify({"error": "admins only"}), 403
+    b = request.get_json(silent=True) or {}
+    decision = b.get("decision")
+    if decision not in ("approved", "rejected"):
+        return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+    if not db.run(conn, "SELECT 1 FROM documents WHERE id = ?", (doc_id,)):
+        return jsonify({"error": "document not found"}), 404
+    conn.execute("UPDATE documents SET status = ?, decided_by = ?, "
+                 "decided_at = datetime('now') WHERE id = ?", (decision, me["id"], doc_id))
+    conn.commit()
+    return jsonify({"ok": True})
+
+
+# ==========================================================================
+# Profile  —  mass-assignment pair (#13) + change password
+# ==========================================================================
+@app.post("/api/profile")
+@require_auth
+def h_update_profile():
+    conn = get_db()
+    uid = g.ident.get("sub")
+    b = request.get_json(silent=True) or {}
+
+    if MODE == "vuln":
+        # VULN (mass assignment #13): every key in the request body is written to
+        # the caller's user row. The profile form only shows name/email/phone/
+        # address, but adding e.g. "role":"admin" (or "password_hash":"<md5>") to
+        # the JSON in Burp updates those columns too -> privilege escalation.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        fields = [k for k in b if k in cols and k != "id"]
+        if not fields:
+            return jsonify({"error": "nothing to update"}), 400
+        conn.execute("UPDATE users SET " + ", ".join(f"{k} = ?" for k in fields) +
+                     " WHERE id = ?", [b[k] for k in fields] + [uid])
+    else:
+        # SECURE: only an explicit whitelist of profile fields is writable; role,
+        # id, password_hash, username, etc. are never taken from the request. Only
+        # the fields actually present in the body are updated, so a partial update
+        # never blanks the others.
+        allowed = ("full_name", "email", "phone", "address")
+        fields = [k for k in allowed if k in b]
+        if not fields:
+            return jsonify({"error": "nothing to update"}), 400
+        conn.execute("UPDATE users SET " + ", ".join(f"{k} = ?" for k in fields) +
+                     " WHERE id = ?", [b[k] for k in fields] + [uid])
+    conn.commit()
+    return jsonify({"user": public_user(load_user(conn, uid))})
+
+
+@app.post("/api/change-password")
+@require_auth
+def h_change_password():
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    b = request.get_json(silent=True) or {}
+    old, new = b.get("old_password") or "", b.get("new_password") or ""
+    # The current password is required in both builds. The secure build additionally
+    # enforces a minimum length.
+    if not auth.verify_password(old, me):
+        return jsonify({"error": "current password is incorrect"}), 403
+    if MODE == "secure" and len(new) < 8:
+        return jsonify({"error": "new password must be at least 8 characters"}), 400
+    if not new:
+        return jsonify({"error": "a new password is required"}), 400
+    h, salt, scheme = auth.hash_password(new, MODE)
+    conn.execute("UPDATE users SET password_hash = ?, salt = ?, hash_scheme = ? WHERE id = ?",
+                 (h, salt, scheme, me["id"]))
+    conn.commit()
+    return jsonify({"ok": True})
+
+
+# ==========================================================================
+# Password reset  —  predictable-token pair (#14)
+# ==========================================================================
+def _reset_token(username):
+    if MODE == "vuln":
+        # VULN (#14): the token is a predictable function of the (public) username,
+        # with no randomness. Anyone who knows a victim's username can compute the
+        # same token and reset the victim's password.
+        return hashlib.md5(("reset:" + username).encode()).hexdigest()[:12]
+    # SECURE: a cryptographically random, single-use token.
+    return secrets.token_urlsafe(24)
+
+
+@app.post("/api/password-reset/request")
+def h_reset_request():
+    conn = get_db()
+    b = request.get_json(silent=True) or {}
+    ident = (b.get("username") or b.get("email") or "").strip()
+    rows = db.run(conn, "SELECT * FROM users WHERE username = ? OR email = ?", (ident, ident))
+    resp = {"ok": True,
+            "message": "If that account exists, a password-reset token has been issued."}
+    if rows:
+        u = rows[0]
+        token = _reset_token(u["username"])
+        conn.execute("DELETE FROM password_resets WHERE user_id = ?", (u["id"],))
+        if MODE == "secure":
+            # SECURE: store only a HASH of the token, and expire it in 15 minutes.
+            conn.execute("INSERT INTO password_resets (user_id, token, expires_at) "
+                         "VALUES (?,?, datetime('now', '+15 minutes'))",
+                         (u["id"], hashlib.sha256(token.encode()).hexdigest()))
+        else:
+            # VULN: store the token as-is, with no meaningful expiry.
+            conn.execute("INSERT INTO password_resets (user_id, token, expires_at) "
+                         "VALUES (?,?, datetime('now', '+100 years'))", (u["id"], token))
+        conn.commit()
+        print(f"[password-reset] token for {u['username']}: {token}")
+        if MODE == "vuln":
+            # VULN: the token is also returned straight to the caller.
+            resp["reset_token"] = token
+    # SECURE: the response is identical whether or not the account exists (no user
+    # enumeration); the token is only written to the server log (would be emailed).
+    return jsonify(resp)
+
+
+@app.post("/api/password-reset/confirm")
+def h_reset_confirm():
+    conn = get_db()
+    b = request.get_json(silent=True) or {}
+    token, new = b.get("token") or "", b.get("new_password") or ""
+    if MODE == "secure":
+        if len(new) < 8:
+            return jsonify({"error": "new password must be at least 8 characters"}), 400
+        # SECURE: match the hashed token, and require it be unused and unexpired.
+        rows = db.run(conn, "SELECT * FROM password_resets WHERE token = ? AND used = 0 "
+                      "AND expires_at > datetime('now')",
+                      (hashlib.sha256(token.encode()).hexdigest(),))
+    else:
+        if not new:
+            return jsonify({"error": "a new password is required"}), 400
+        # VULN: the token is matched as-is, with no expiry or single-use check.
+        rows = db.run(conn, "SELECT * FROM password_resets WHERE token = ?", (token,))
+    if not rows:
+        return jsonify({"error": "invalid or expired reset token"}), 400
+    r = rows[0]
+    h, salt, scheme = auth.hash_password(new, MODE)
+    conn.execute("UPDATE users SET password_hash = ?, salt = ?, hash_scheme = ? WHERE id = ?",
+                 (h, salt, scheme, r["user_id"]))
+    conn.execute("UPDATE password_resets SET used = 1 WHERE id = ?", (r["id"],))
+    conn.commit()
+    return jsonify({"ok": True})
 
 
 def main():

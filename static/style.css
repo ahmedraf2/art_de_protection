@@ -192,6 +192,37 @@ tr:last-child td { border-bottom: none; }
 .hashline .k { color: var(--muted); width: 64px; display: inline-block; }
 .hashline code { font-family: "Consolas", "SF Mono", ui-monospace, monospace; color: #9db0e8; }
 
+/* ---------- branding ---------- */
+.logo { width: 26px; height: 26px; flex: none; }
+.brand { font-weight: 700; font-size: 1.1rem; display: flex; align-items: center; gap: 10px; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.12; }
+.brand-org { font-weight: 700; }
+.brand-sub { font-size: .72rem; color: var(--muted); font-weight: 500; }
+.auth-brand { display: flex; align-items: center; justify-content: center; gap: 10px; }
+.auth-brand .logo { width: 30px; height: 30px; }
+.auth-brand .brand-text { text-align: left; }
+.auth-foot { text-align: center; color: var(--muted); font-size: .74rem; margin-top: 18px; }
+.year-pill { font-size: .74rem; color: var(--muted); border: 1px solid var(--line); border-radius: 20px; padding: 3px 10px; }
+.app-footer { text-align: center; color: var(--muted); font-size: .76rem; padding: 18px; border-top: 1px solid var(--line); background: var(--panel); }
+textarea { resize: vertical; }
+
+/* ---------- announcements ---------- */
+.announce + .announce { margin-top: 14px; }
+.announce .announce-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.announce .announce-head h3 { margin: 0; }
+.announce-meta { font-size: .8rem; color: var(--muted); margin: 2px 0 10px; }
+.announce-body { white-space: pre-wrap; }
+
+/* ---------- attestation / official document ---------- */
+.attestation { max-width: 680px; }
+.att-head { display: flex; align-items: center; gap: 14px; border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 4px; }
+.att-head .logo { width: 40px; height: 40px; }
+.att-org { font-weight: 700; font-size: 1.1rem; }
+.att-title { margin: 10px 0 14px; }
+.att-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0; }
+.att-grid .k { display: block; color: var(--muted); font-size: .78rem; margin-bottom: 2px; }
+.att-foot { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 16px; font-size: .8rem; }
+
 @media (max-width: 820px) {
   .layout { grid-template-columns: 1fr; }
   .sidebar { display: flex; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--line); }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Campus Portal</title>
+  <title>Meridian University — Student Portal</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -11,22 +11,25 @@
   <!-- ============ AUTH: LOGIN ============ -->
   <div id="login-screen" class="auth-screen">
     <div class="auth-card">
-      <div class="auth-brand">🎓 Campus Portal</div>
-      <p class="auth-sub">Sign in to your student account</p>
+      <div class="auth-brand" id="brand-login"></div>
+      <p class="auth-sub">Sign in to the student portal</p>
       <label>Username</label>
       <input id="li-user" placeholder="username" autocomplete="username" />
       <label>Password</label>
-      <input id="li-pass" type="password" placeholder="password" autocomplete="current-password" />
+      <input id="li-pass" type="password" placeholder="password" autocomplete="current-password"
+             onkeydown="if(event.key==='Enter')doLogin()" />
       <div id="li-error" class="form-error"></div>
       <button class="btn-primary btn-block" onclick="doLogin()">Sign in</button>
+      <p class="auth-switch"><a onclick="showReset()">Forgot your password?</a></p>
       <p class="auth-switch">Don't have an account? <a onclick="showRegister()">Create one</a></p>
+      <div class="auth-foot" id="foot-login"></div>
     </div>
   </div>
 
   <!-- ============ AUTH: REGISTER ============ -->
   <div id="register-screen" class="auth-screen hidden">
     <div class="auth-card">
-      <div class="auth-brand">🎓 Campus Portal</div>
+      <div class="auth-brand" id="brand-register"></div>
       <p class="auth-sub">Create your student account</p>
       <label>Full name</label>
       <input id="rg-name" placeholder="Your name" />
@@ -36,19 +39,38 @@
       <input id="rg-email" placeholder="you@campus.edu" />
       <label>Password</label>
       <input id="rg-pass" type="password" placeholder="choose a password" />
-      <label>Account type</label>
-      <input value="Student" disabled />
       <div id="rg-error" class="form-error"></div>
       <button class="btn-primary btn-block" onclick="doRegister()">Create account</button>
       <p class="auth-switch">Already have an account? <a onclick="showLogin()">Sign in</a></p>
     </div>
   </div>
 
+  <!-- ============ AUTH: PASSWORD RESET ============ -->
+  <div id="reset-screen" class="auth-screen hidden">
+    <div class="auth-card">
+      <div class="auth-brand" id="brand-reset"></div>
+      <p class="auth-sub">Reset your password</p>
+      <label>Username or email</label>
+      <input id="rs-user" placeholder="username" onkeydown="if(event.key==='Enter')requestReset()" />
+      <button class="btn-ghost btn-block" onclick="requestReset()">Send reset token</button>
+      <div id="rs-token-box" class="hidden">
+        <label>Reset token</label>
+        <input id="rs-token" placeholder="paste the reset token" />
+        <label>New password</label>
+        <input id="rs-new" type="password" placeholder="choose a new password" />
+        <button class="btn-primary btn-block" onclick="confirmReset()">Set new password</button>
+      </div>
+      <div id="rs-msg" class="form-error"></div>
+      <p class="auth-switch"><a onclick="showLogin()">Back to sign in</a></p>
+    </div>
+  </div>
+
   <!-- ============ APP ============ -->
   <div id="app" class="hidden">
     <header class="topbar">
-      <div class="brand">🎓 <span>Campus Portal</span></div>
+      <div class="brand" id="brand-top"></div>
       <div class="topbar-right">
+        <span class="year-pill" id="year-pill"></span>
         <span class="welcome">Welcome, <b id="tb-name">—</b></span>
         <div class="usermenu">
           <button class="avatar" id="avatar" onclick="toggleMenu(event)">?</button>
@@ -64,6 +86,7 @@
       <aside class="sidebar" id="sidebar"></aside>
       <main id="content"></main>
     </div>
+    <footer class="app-footer" id="app-footer"></footer>
   </div>
 
   <script src="/static/app.js"></script>

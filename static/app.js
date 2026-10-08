@@ -56,6 +56,26 @@ async function api(method, path, body) {
 }
 const get = async (p) => (await api("GET", p)).data;
 
+// multipart variant for file uploads (let the browser set the boundary header)
+async function apiForm(method, path, formData) {
+  const h = {};
+  if (token()) h["Authorization"] = "Bearer " + token();
+  const res = await fetch(path, { method, headers: h, body: formData });
+  if (res.status === 401 && token()) { sessionExpired(); return { status: 401, data: { error: "session expired" } }; }
+  let data; try { data = await res.json(); } catch { data = {}; }
+  return { status: res.status, data };
+}
+
+// Download an attachment (auth header required, so fetch -> blob -> open in a tab).
+// In the vuln build the server serves it inline, so an uploaded .html/.svg runs.
+async function downloadDoc(id, which) {
+  const res = await fetch(`/api/documents/${id}/download?which=${which}`,
+    { headers: token() ? { Authorization: "Bearer " + token() } : {} });
+  if (!res.ok) { alert("Download failed (" + res.status + ")"); return; }
+  const blob = await res.blob();
+  window.open(URL.createObjectURL(blob), "_blank");
+}
+
 function sessionExpired() {
   if (!token()) return;
   clearToken(); USER = null;
@@ -128,7 +148,7 @@ const NAV = [
   { view: "announcements", label: "Announcements", icon: "📢", roles: ["student", "professor", "admin"] },
   { view: "chat", label: "Chat", icon: "💬", roles: ["student", "professor", "admin"] },
   { view: "courses", label: "Courses", icon: "📚", roles: ["student", "professor", "admin"] },
-  { view: "search", label: "Directory", icon: "🔍", roles: ["student", "professor", "admin"] },
+  { view: "search", label: "Course search", icon: "🔍", roles: ["student", "professor"] },
   { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student"] },
   { view: "documents", label: "Documents", icon: "📄", roles: ["student", "admin"] },
   { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor"] },
@@ -366,29 +386,28 @@ async function postAnnouncement() {
   if (status === 201) VIEWS.announcements();
 }
 
-// ---- directory (search) ----
+// ---- course search ----
 VIEWS.search = async function () {
   $("content").innerHTML = `
-    <div class="page-title">Directory</div>
-    <p class="page-sub">Search students, professors and staff by name.</p>
+    <div class="page-title">Course search</div>
+    <p class="page-sub">Find a course by its code or name.</p>
     <div class="card" style="max-width:640px">
       <div style="display:flex;gap:8px">
-        <input id="dir-q" placeholder="Search by name…" style="flex:1"
+        <input id="dir-q" placeholder="e.g. Programming or PROG…" style="flex:1"
                onkeydown="if(event.key==='Enter')runSearch()" />
         <button class="btn-primary" onclick="runSearch()">Search</button>
       </div>
     </div>
-    <div class="card mt"><div id="dir-results" class="muted">Type a name and hit Search.</div></div>`;
+    <div class="card mt"><div id="dir-results" class="muted">Type a course code or name and hit Search.</div></div>`;
 };
 async function runSearch() {
   const q = $("dir-q").value;
   const d = await get("/api/search?query=" + encodeURIComponent(q));
   const rows = d.results || [];
   const box = $("dir-results");
-  if (!rows.length) { box.innerHTML = `<p class="muted">No matches.</p>`; return; }
-  box.innerHTML = `<table><thead><tr><th>Name</th><th>Role</th></tr></thead>
-    <tbody>${rows.map(r => `<tr><td>${esc(r.full_name)}</td>
-      <td><span class="badge-role">${esc(r.role)}</span></td></tr>`).join("")}</tbody></table>`;
+  if (!rows.length) { box.innerHTML = `<p class="muted">No matching courses.</p>`; return; }
+  box.innerHTML = `<table><thead><tr><th>Code</th><th>Name</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td><b>${esc(r.code)}</b></td><td>${esc(r.name)}</td></tr>`).join("")}</tbody></table>`;
 }
 
 // ---- certifications ----
@@ -429,14 +448,20 @@ async function renderMyDocuments() {
   const rows = (d.documents || []).map(x => `
     <tr><td>${esc(x.reference || ("#" + x.id))}</td><td>${esc(x.doc_type)}</td>
       <td>${docStatus(x.status)}</td><td>${esc(fmtDate(x.created_at))}</td>
-      <td>${x.status === "approved"
-        ? `<button class="btn-ghost sm" onclick="nav('documents?doc=${x.id}')">View</button>` : ""}</td></tr>`).join("");
+      <td>${x.request_file
+        ? `<button class="btn-ghost sm" onclick="downloadDoc(${x.id},'request')">My upload</button>` : ""}
+        ${x.status === "approved"
+          ? `<button class="btn-ghost sm" onclick="nav('documents?doc=${x.id}')">View</button>
+             ${x.issued_file ? `<button class="btn-primary sm" onclick="downloadDoc(${x.id},'issued')">Download PDF</button>` : ""}`
+          : ""}</td></tr>`).join("");
   $("content").innerHTML = `
     <div class="page-title">Documents</div>
     <p class="page-sub">Request official documents from the registrar's office.</p>
     <div class="card" style="max-width:520px">
       <label>Document type</label>
       <select id="doc-type">${DOC_TYPES.map(t => `<option>${esc(t)}</option>`).join("")}</select>
+      <label>Supporting document (PDF)</label>
+      <input id="doc-file" type="file" accept="application/pdf" />
       <div id="doc-msg" class="form-error"></div>
       <button class="btn-primary btn-block" onclick="requestDocument()">Submit request</button>
     </div>
@@ -445,29 +470,47 @@ async function renderMyDocuments() {
       <tbody>${rows || `<tr><td colspan="5" class="muted">No requests yet.</td></tr>`}</tbody></table></div>`;
 }
 async function requestDocument() {
-  const { status, data } = await api("POST", "/api/documents", { doc_type: $("doc-type").value });
   const m = $("doc-msg");
+  const f = $("doc-file").files[0];
+  if (!f) { m.style.color = "var(--bad)"; m.textContent = "Attach a supporting PDF."; return; }
+  const fd = new FormData();
+  fd.append("doc_type", $("doc-type").value);
+  fd.append("attachment", f);
+  const { status, data } = await apiForm("POST", "/api/documents", fd);
   m.style.color = status === 201 ? "var(--good)" : "var(--bad)";
   m.textContent = status === 201 ? "Request submitted." : (data.error || "Failed");
   if (status === 201) renderMyDocuments();
 }
 async function renderAdminDocuments() {
   const d = await get("/api/admin/documents");
-  const rows = (d.documents || []).map(x => `
-    <tr><td>${esc(x.reference || ("#" + x.id))}</td><td>${esc(x.student)}</td><td>${esc(x.doc_type)}</td>
-      <td>${docStatus(x.status)}</td><td>${esc(fmtDate(x.created_at))}</td>
-      <td>${x.status === "pending"
-        ? `<button class="btn-primary sm" onclick="decideDoc(${x.id},'approved')">Approve</button>
-           <button class="btn-ghost sm" onclick="decideDoc(${x.id},'rejected')">Reject</button>`
-        : `<button class="btn-ghost sm" onclick="nav('documents?doc=${x.id}')">View</button>`}</td></tr>`).join("");
+  const rows = (d.documents || []).map(x => {
+    const studentUpload = x.request_file
+      ? `<button class="btn-ghost sm" onclick="downloadDoc(${x.id},'request')">Student upload</button>` : "";
+    const action = x.status === "pending"
+      ? `<input id="apf-${x.id}" type="file" accept="application/pdf" class="inline-file" />
+         <button class="btn-primary sm" onclick="decideDoc(${x.id},'approved')">Approve + upload PDF</button>
+         <button class="btn-ghost sm" onclick="decideDoc(${x.id},'rejected')">Reject</button>`
+      : `<button class="btn-ghost sm" onclick="nav('documents?doc=${x.id}')">View</button>
+         ${x.issued_file ? `<button class="btn-primary sm" onclick="downloadDoc(${x.id},'issued')">Issued PDF</button>` : ""}`;
+    return `<tr><td>${esc(x.reference || ("#" + x.id))}</td><td>${esc(x.student)}</td><td>${esc(x.doc_type)}</td>
+      <td>${docStatus(x.status)}</td><td>${studentUpload}</td><td>${action}</td></tr>`;
+  }).join("");
   $("content").innerHTML = `
     <div class="page-title">Document requests</div>
-    <p class="page-sub">Approve or reject student document requests.</p>
-    <div class="card"><table><thead><tr><th>Reference</th><th>Student</th><th>Type</th><th>Status</th><th>Requested</th><th></th></tr></thead>
+    <p class="page-sub">Review the student's upload, then approve by uploading the issued PDF.</p>
+    <div class="card"><table><thead><tr><th>Reference</th><th>Student</th><th>Type</th><th>Status</th><th>Upload</th><th>Action</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="6" class="muted">No requests.</td></tr>`}</tbody></table></div>`;
 }
 async function decideDoc(id, decision) {
-  const { status, data } = await api("POST", `/api/admin/documents/${id}/decide`, { decision });
+  const fd = new FormData();
+  fd.append("decision", decision);
+  if (decision === "approved") {
+    const inp = $("apf-" + id);
+    const f = inp && inp.files[0];
+    if (!f) { alert("Attach the issued PDF to approve."); return; }
+    fd.append("document", f);
+  }
+  const { status, data } = await apiForm("POST", `/api/admin/documents/${id}/decide`, fd);
   if (status !== 200) { alert((data && data.error) || "Failed"); return; }
   renderAdminDocuments();
 }
@@ -497,6 +540,7 @@ function attestation(d) {
       <div><span class="k">Issued</span>${esc(fmtDate(d.decided_at || d.created_at))}</div>
       <div><span class="k">Student e-mail</span>${esc(d.student_email || "—")}</div>
     </div>
+    ${d.issued_file ? `<button class="btn-primary" onclick="downloadDoc(${d.id},'issued')">Download issued PDF</button>` : ""}
     <p class="att-foot muted">Generated by the ${ORG_NAME} Student Portal.
        Verify authenticity at the registrar's office.</p></div>`;
 }
@@ -538,7 +582,9 @@ async function renderLedger() {
 VIEWS.chat = async function (params) {
   const u0 = params.get("chat_users[0]"), u1 = params.get("chat_users[1]");
   if (u0 && u1) return renderConversation(u0, u1);
-  const d = await get("/api/chats");
+  const [d, dir] = await Promise.all([get("/api/chats"), get("/api/users/directory")]);
+  const opts = (dir.users || []).map(u =>
+    `<option value="${u.id}">${esc(u.full_name)} — ${esc(u.role)}</option>`).join("");
   const items = (d.chats || []).map(ch => `
     <div class="chat-item" onclick="openChat(${d.me}, ${ch.user_id})">
       <div class="ci-avatar">${initials(ch.name)}</div>
@@ -548,9 +594,30 @@ VIEWS.chat = async function (params) {
       </div>
     </div>`).join("");
   $("content").innerHTML = `
-    <div class="page-title">Chat</div><p class="page-sub">Your conversations</p>
+    <div class="page-title">Chat</div><p class="page-sub">Message anyone on the platform</p>
+    <div class="card" style="max-width:640px">
+      <h3>New message</h3>
+      <label>To</label>
+      <select id="nm-to">${opts || `<option value="">— no other users —</option>`}</select>
+      <label>Message</label>
+      <textarea id="nm-body" rows="2" placeholder="Write a message…"
+                onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();startNewMessage();}"></textarea>
+      <div id="nm-msg" class="form-error"></div>
+      <button class="btn-primary" onclick="startNewMessage()">Send message</button>
+    </div>
+    <h3 class="mt">Your conversations</h3>
     <div class="chat-list">${items || `<p class="muted">No conversations yet.</p>`}</div>`;
 };
+
+async function startNewMessage() {
+  const to = Number($("nm-to").value);
+  const body = $("nm-body").value.trim();
+  const m = $("nm-msg");
+  if (!to || !body) { m.style.color = "var(--bad)"; m.textContent = "Pick a recipient and type a message."; return; }
+  const { status, data } = await api("POST", "/api/chat", { to, body });
+  if (status === 201) openChat(USER.id, to);   // jump into the conversation
+  else { m.style.color = "var(--bad)"; m.textContent = (data && data.error) || "Failed to send."; }
+}
 
 function openChat(me, other) { location.hash = `chat?chat_users[0]=${me}&chat_users[1]=${other}`; }
 

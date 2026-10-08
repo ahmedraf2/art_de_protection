@@ -114,12 +114,14 @@ anvil keeps no state: **after restarting anvil, restart the secure build with
 | 7 | Insecure password hashing (unsalted MD5) | `auth.hash_password` |
 | 8 | Missing signature / encryption at rest | certifications & messages |
 | 9 | No integrity anchoring (grade/cert tampering undetected) | `GET /api/grades/integrity`, `GET /api/blockchain` |
-| 10 | SQL injection (people search, stacked write → grade change) | `GET /api/search` |
+| 10 | SQL injection (course search, stacked write → grade change) | `GET /api/search` |
 | 11 | Stored XSS (announcements feed) | `POST /api/announcements` + client render |
 | 12 | IDOR — read any student's document | `GET /api/documents/<id>` |
 | 13 | Mass assignment (profile update sets `role`) | `POST /api/profile` |
 | 14 | Predictable password-reset token | `POST /api/password-reset/{request,confirm}` |
+| 15 | Unrestricted file upload + path traversal + IDOR | `POST /api/documents`, `GET /api/documents/<id>/download` |
 
+Try every vuln by hand (browser + DevTools): **[MANUAL_TESTING.md](MANUAL_TESTING.md)**.
 Full exploit steps and fixes: **[VULNERABILITIES.md](VULNERABILITIES.md)**.
 Step-by-step live-demo script: **[DEMO.md](DEMO.md)**.
 Design & data flow: **[ARCHITECTURE.md](ARCHITECTURE.md)**.

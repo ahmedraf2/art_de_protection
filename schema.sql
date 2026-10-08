@@ -83,14 +83,16 @@ CREATE TABLE IF NOT EXISTS announcements (
 -- The registrar (admin) approves or rejects; an approved document can be viewed
 -- by reference. Reading a document by id is an IDOR in the vuln build (#12).
 CREATE TABLE IF NOT EXISTS documents (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    student_id  INTEGER NOT NULL,
-    doc_type    TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending',   -- 'pending' | 'approved' | 'rejected'
-    reference   TEXT,
-    created_at  TEXT DEFAULT (datetime('now')),
-    decided_by  INTEGER,
-    decided_at  TEXT,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id   INTEGER NOT NULL,
+    doc_type     TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',   -- 'pending' | 'approved' | 'rejected'
+    reference    TEXT,
+    request_file TEXT,                               -- student-uploaded supporting PDF
+    issued_file  TEXT,                               -- registrar-uploaded issued PDF
+    created_at   TEXT DEFAULT (datetime('now')),
+    decided_by   INTEGER,
+    decided_at   TEXT,
     FOREIGN KEY (student_id) REFERENCES users(id),
     FOREIGN KEY (decided_by) REFERENCES users(id)
 );

@@ -189,6 +189,11 @@ def init_db(mode, reset=False):
     for col in ("phone", "address"):
         if col not in ucols:
             conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+    # migrate older databases that predate the documents file-upload columns
+    dcols = [r["name"] for r in conn.execute("PRAGMA table_info(documents)").fetchall()]
+    for col in ("request_file", "issued_file"):
+        if col not in dcols:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {col} TEXT")
     # db_file not found means fresh start
     if fresh:
         try:

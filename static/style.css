@@ -126,6 +126,8 @@ tr:last-child td { border-bottom: none; }
 .alert-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .alert-head h3 { color: var(--bad); margin: 0; }
 .btn-ghost.sm, .btn-primary.sm { padding: 4px 12px; font-size: .8rem; }
+.inline-file { width: auto; display: inline-block; padding: 4px; font-size: .78rem; margin-right: 6px; vertical-align: middle; }
+input[type=file] { padding: 8px; }
 
 /* course cards */
 .course { background: var(--panel2); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }

@@ -9,3 +9,4 @@ contracts/cache/
 *.odp
 *.png
 .anvil/
+uploads/

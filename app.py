@@ -18,7 +18,7 @@ import secrets
 import functools
 from datetime import date
 
-from flask import Flask, request, jsonify, g, send_from_directory
+from flask import Flask, request, jsonify, g, send_from_directory, send_file
 
 import auth
 import db
@@ -33,6 +33,8 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "3000"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(HERE, "static")
+UPLOAD_DIR = os.path.join(HERE, "uploads", MODE)   # document attachments (per build)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
 
@@ -203,29 +205,42 @@ def h_courses():
 @app.get("/api/search")
 @require_auth
 def h_search():
-    """People directory: find users by name (any authenticated user)."""
+    """Course search: find courses by code or name (any student or professor)."""
     conn = get_db()
     query = request.args.get("query", "")
 
     if MODE == "vuln":
-        # VULN: the search term is concatenated straight into SQL and run with a
-        # helper that also executes STACKED statements. A classic read works:
+        # VULN (#10): the search term is concatenated straight into SQL and run
+        # with a helper that also executes STACKED statements. A classic read works
+        # (the result has 3 columns, so a 3-column UNION lines up):
         #   ?query=' UNION SELECT id, password_hash, role FROM users --
         # but because the statement can be stacked, the search box is also a
         # WRITE primitive — no admin login, no Gradebook access needed:
         #   ?query=%'; UPDATE grades SET grade='20.00'
         #           WHERE student_id=4 AND course_id=1; --
         # changes Alice's Mathematics grade, and nothing in this build notices.
-        sql = ("SELECT id, full_name, role FROM users "
-               "WHERE full_name LIKE '%" + query + "%' ORDER BY full_name")
+        sql = ("SELECT id, code, name FROM courses "
+               "WHERE name LIKE '%" + query + "%' OR code LIKE '%" + query + "%' ORDER BY code")
         rows = db.run_raw_multi(conn, sql)
     else:
         # SECURE: the term is bound as a parameter (so it is only ever data, never
         # SQL) and the query is a single statement — stacked writes are impossible.
         rows = db.run(conn,
-            "SELECT id, full_name, role FROM users WHERE full_name LIKE ? ORDER BY full_name",
-            ("%" + query + "%",))
+            "SELECT id, code, name FROM courses WHERE name LIKE ? OR code LIKE ? ORDER BY code",
+            ("%" + query + "%", "%" + query + "%"))
     return jsonify({"results": rows})
+
+
+@app.get("/api/users/directory")
+@require_auth
+def h_user_directory():
+    """Everyone the caller can start a conversation with (any authenticated user).
+    Parameterized and read-only — this is the messaging recipient picker, not the
+    injectable course search above."""
+    uid = g.ident.get("sub")
+    rows = db.run(get_db(),
+        "SELECT id, full_name, username, role FROM users WHERE id != ? ORDER BY full_name", (uid,))
+    return jsonify({"users": rows})
 
 
 @app.get("/api/my/courses")
@@ -779,20 +794,53 @@ def h_post_announcement():
 
 
 # ==========================================================================
-# Administrative documents  —  IDOR pair (#12)
+# Administrative documents  —  IDOR pair (#12) + file-upload pair (#15)
 # ==========================================================================
+def _save_upload(fs):
+    """Store an uploaded file and return the filename to record in the DB.
+    Raises ValueError (secure build only) when the file is rejected."""
+    if MODE == "vuln":
+        # VULN (#15): the client-supplied filename is trusted (path traversal on
+        # write) and there is NO content-type / extension / size check. Combined
+        # with the inline download below, uploading a .svg/.html "document" that
+        # contains a <script> becomes a stored XSS that fires for whoever opens it
+        # (e.g. the registrar reviewing the request).
+        name = fs.filename or "upload.bin"
+        dest = os.path.join(UPLOAD_DIR, name)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        fs.save(dest)
+        return name
+    # SECURE: ignore the client filename, require a real PDF (magic bytes), cap the
+    # size, and store under a random, server-generated name inside the upload dir.
+    data = fs.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise ValueError("file too large (max 5 MB)")
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("only PDF files are accepted")
+    name = secrets.token_hex(16) + ".pdf"
+    with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
+        f.write(data)
+    return name
+
+
 @app.post("/api/documents")
 @require_auth
 def h_request_document():
-    """A student requests an official document about themselves."""
+    """A student requests an official document and attaches a supporting PDF."""
     conn = get_db()
     me = load_user(conn, g.ident.get("sub"))
-    b = request.get_json(silent=True) or {}
-    doc_type = b.get("doc_type")
+    doc_type = request.form.get("doc_type")
     if doc_type not in db.DOC_TYPES:
         return jsonify({"error": "unknown document type"}), 400
-    cur = conn.execute("INSERT INTO documents (student_id, doc_type) VALUES (?,?)",
-                       (me["id"], doc_type))
+    fs = request.files.get("attachment")
+    if not (fs and fs.filename):
+        return jsonify({"error": "please attach a supporting PDF"}), 400
+    try:
+        stored = _save_upload(fs)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    cur = conn.execute("INSERT INTO documents (student_id, doc_type, request_file) VALUES (?,?,?)",
+                       (me["id"], doc_type, stored))
     conn.execute("UPDATE documents SET reference = ? WHERE id = ?",
                  (f"DOC-{date.today().year}-{cur.lastrowid:04d}", cur.lastrowid))
     conn.commit()
@@ -803,8 +851,8 @@ def h_request_document():
 @require_auth
 def h_my_documents():
     rows = db.run(get_db(),
-        "SELECT id, doc_type, status, reference, created_at, decided_at "
-        "FROM documents WHERE student_id = ? ORDER BY id DESC", (g.ident.get("sub"),))
+        "SELECT id, doc_type, status, reference, created_at, decided_at, request_file, "
+        "issued_file FROM documents WHERE student_id = ? ORDER BY id DESC", (g.ident.get("sub"),))
     return jsonify({"documents": rows})
 
 
@@ -829,6 +877,40 @@ def h_get_document(doc_id):
     return jsonify({"document": doc})
 
 
+@app.get("/api/documents/<int:doc_id>/download")
+@require_auth
+def h_download_document(doc_id):
+    """Download a document's attachment (the student's upload or the issued PDF)."""
+    conn = get_db()
+    rows = db.run(conn, "SELECT * FROM documents WHERE id = ?", (doc_id,))
+    if not rows:
+        return jsonify({"error": "document not found"}), 404
+    doc = rows[0]
+    which = request.args.get("which", "issued")
+    stored = doc["issued_file"] if which == "issued" else doc["request_file"]
+
+    if MODE == "vuln":
+        # VULN (#15): no ownership check (any logged-in user pulls anyone's files —
+        # IDOR), the served path can be overridden with ?name= (directory traversal:
+        #   ?name=../../keys/eth_issuer.key   leaks the on-chain signing key,
+        #   ?name=../../sms_vuln.db           downloads the whole database)
+        # and the file is sent INLINE, so an uploaded .html/.svg runs as stored XSS.
+        name = request.args.get("name") or stored
+        if not name:
+            return jsonify({"error": "no file for this document"}), 404
+        return send_file(os.path.join(UPLOAD_DIR, name))
+    # SECURE: only the owner (or staff/admin) may download; always serve the file
+    # recorded for THIS document, as an attachment with a fixed PDF content type,
+    # and never from a client-supplied path.
+    me = load_user(conn, g.ident.get("sub"))
+    if me["role"] == "student" and doc["student_id"] != me["id"]:
+        return jsonify({"error": "forbidden"}), 403
+    if not stored:
+        return jsonify({"error": "no file for this document"}), 404
+    return send_file(os.path.join(UPLOAD_DIR, stored), mimetype="application/pdf",
+                     as_attachment=True, download_name=f"{doc['reference'] or doc_id}.pdf")
+
+
 @app.get("/api/admin/documents")
 @require_auth
 def h_admin_documents():
@@ -838,8 +920,8 @@ def h_admin_documents():
         return jsonify({"error": "admins only"}), 403
     rows = db.run(conn,
         "SELECT d.id, d.doc_type, d.status, d.reference, d.created_at, d.decided_at, "
-        "u.full_name AS student FROM documents d JOIN users u ON u.id = d.student_id "
-        "ORDER BY (d.status = 'pending') DESC, d.id DESC")
+        "d.request_file, d.issued_file, u.full_name AS student FROM documents d "
+        "JOIN users u ON u.id = d.student_id ORDER BY (d.status = 'pending') DESC, d.id DESC")
     return jsonify({"documents": rows})
 
 
@@ -850,14 +932,25 @@ def h_decide_document(doc_id):
     me = load_user(conn, g.ident.get("sub"))
     if not me or me["role"] != "admin":
         return jsonify({"error": "admins only"}), 403
-    b = request.get_json(silent=True) or {}
-    decision = b.get("decision")
+    decision = request.form.get("decision")
     if decision not in ("approved", "rejected"):
         return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
     if not db.run(conn, "SELECT 1 FROM documents WHERE id = ?", (doc_id,)):
         return jsonify({"error": "document not found"}), 404
-    conn.execute("UPDATE documents SET status = ?, decided_by = ?, "
-                 "decided_at = datetime('now') WHERE id = ?", (decision, me["id"], doc_id))
+    stored = None
+    if decision == "approved":
+        # The registrar uploads the signed/issued PDF when approving. Same unsafe
+        # vs. safe handling as the student upload (#15).
+        fs = request.files.get("document")
+        if not (fs and fs.filename):
+            return jsonify({"error": "attach the issued PDF to approve"}), 400
+        try:
+            stored = _save_upload(fs)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+    conn.execute("UPDATE documents SET status = ?, decided_by = ?, decided_at = datetime('now'), "
+                 "issued_file = COALESCE(?, issued_file) WHERE id = ?",
+                 (decision, me["id"], stored, doc_id))
     conn.commit()
     return jsonify({"ok": True})
 

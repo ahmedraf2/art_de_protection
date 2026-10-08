@@ -105,11 +105,20 @@ GRADES = [
     ("carol", "NET",  "15.00"),
 ]
 
+# The fixed menu of certificates a professor may issue (the title is built as
+# "<type>: <course name>"). Kept short so it is easy to pick from in class.
+CERT_TYPES = [
+    "Course Completion",
+    "Certificate of Achievement",
+    "Online Course Certificate",
+    "Honors Distinction",
+]
+
 CERTS = [
-    # student, title,               grade, issued_date
-    ("alice", "Python Developer",   "A",   "2026-06-15"),
-    ("alice", "Database Design",    "B+",  "2026-07-01"),
-    ("bob",   "Data Analyst",       "A-",  "2026-06-20"),
+    # student, cert_type,                  course, issued_date  (issued by that course's professor)
+    ("alice", "Course Completion",         "PROG", "2026-06-15"),
+    ("alice", "Certificate of Achievement","DB",   "2026-07-01"),
+    ("bob",   "Course Completion",         "PHYS", "2026-06-20"),
 ]
 
 # Chat messages: (sender, recipient, body). Inserted in order.
@@ -154,6 +163,10 @@ def init_db(mode, reset=False):
     with open(SCHEMA_PATH) as f:
         # read the entire schema.sql , then execute it as a series of SQL statements using SQLite connection
         conn.executescript(f.read())
+    # migrate older databases that predate the certifications.issued_by column
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(certifications)").fetchall()]
+    if "issued_by" not in cols:
+        conn.execute("ALTER TABLE certifications ADD COLUMN issued_by INTEGER")
     # db_file not found means fresh start
     if fresh:
         try:
@@ -198,13 +211,19 @@ def _seed(conn, mode):
             eth_ledger.anchor_grade(cid[code], uid[student],
                                     eth_ledger.grade_hash(cid[code], uid[student], grade))
 
-    for student, title, grade, date in CERTS:
+    course_name = {code: name for code, name, _ in COURSES}
+    course_prof = {code: prof for code, _, prof in COURSES}
+    grade_of = {(s, c): g for s, c, g in GRADES}
+    for student, ctype, code, date in CERTS:
+        title = f"{ctype}: {course_name[code]}"
+        grade = grade_of.get((student, code), "Completed")
+        issued_by = uid[course_prof[code]]            # the professor who teaches the course
         # SECURE: issuer signs the certificate. VULN mode leaves it unsigned,
         # so a forged certificate cannot be told apart from a real one.
         sig = cu.sign_cert(uid[student], title, grade, date) if mode == "secure" else None
         conn.execute(
-            "INSERT INTO certifications (student_id, title, grade, issued_date, signature) "
-            "VALUES (?,?,?,?,?)", (uid[student], title, grade, date, sig))
+            "INSERT INTO certifications (student_id, title, grade, issued_date, signature, issued_by) "
+            "VALUES (?,?,?,?,?,?)", (uid[student], title, grade, date, sig, issued_by))
         if mode == "secure":
             # SECURE: anchor the certificate's fingerprint so a forged or
             # injected certificate can be spotted ("not on chain").

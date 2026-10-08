@@ -14,6 +14,7 @@ Vulnerable branches are marked  # VULN:  and their fixes  # SECURE:.
 
 import os
 import functools
+from datetime import date
 
 from flask import Flask, request, jsonify, g, send_from_directory
 
@@ -294,38 +295,107 @@ def h_certifications():
     return jsonify({"certifications": rows})
 
 
+@app.get("/api/my/roster")
+@require_auth
+def h_my_roster():
+    """A professor's courses with the students enrolled in each (for grading /
+    issuing certificates). Admins see every course. Students may not."""
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] not in ("professor", "admin"):
+        return jsonify({"error": "professors only"}), 403
+    sql = ("SELECT c.id AS course_id, c.code, c.name, u.id AS student_id, u.full_name "
+           "FROM courses c JOIN enrollments e ON e.course_id = c.id "
+           "JOIN users u ON u.id = e.student_id AND u.role = 'student' ")
+    params = ()
+    if me["role"] == "professor":
+        sql += "WHERE c.professor_id = ? "
+        params = (me["id"],)
+    sql += "ORDER BY c.name, u.full_name"
+    courses = {}
+    for r in db.run(conn, sql, params):
+        c = courses.setdefault(r["course_id"],
+                               {"course_id": r["course_id"], "code": r["code"],
+                                "name": r["name"], "students": []})
+        c["students"].append({"id": r["student_id"], "full_name": r["full_name"]})
+    return jsonify({"courses": list(courses.values()), "cert_types": db.CERT_TYPES})
+
+
+@app.get("/api/my/certifications-issued")
+@require_auth
+def h_my_issued_certs():
+    """Certificates the current professor/admin has issued, with student names."""
+    conn = get_db()
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] not in ("professor", "admin"):
+        return jsonify({"error": "professors only"}), 403
+    rows = db.run(conn,
+        "SELECT c.id, c.title, c.grade, c.issued_date, u.full_name AS student "
+        "FROM certifications c JOIN users u ON u.id = c.student_id "
+        "WHERE c.issued_by = ? ORDER BY c.id DESC", (me["id"],))
+    return jsonify({"certifications": rows})
+
+
 @app.post("/api/certifications")
 @require_auth
 def h_issue_cert():
     conn = get_db()
     b = request.get_json(silent=True) or {}
 
-    if MODE == "secure":
-        # SECURE: only admins may issue certificates.
-        me = load_user(conn, g.ident.get("sub"))
-        if not me or me["role"] != "admin":
-            return jsonify({"error": "admins only"}), 403
-    # VULN: no authorization check — any user can mint a certificate for anyone.
+    if MODE == "vuln":
+        # VULN: no authorization check — any logged-in user can mint a certificate
+        # for anyone, with any client-supplied title, unsigned and unanchored
+        # (vulnerabilities #6b and #8). Behaviour unchanged.
+        student_id, title = b.get("student_id"), b.get("title")
+        grade, issued = b.get("grade"), b.get("issued_date")
+        conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
+                     "signature, issued_by) VALUES (?,?,?,?,?,?)",
+                     (student_id, title, grade, issued, None, g.ident.get("sub")))
+        conn.commit()
+        return jsonify({"ok": True}), 201
 
-    student_id, title = b.get("student_id"), b.get("title")
-    grade, issued = b.get("grade"), b.get("issued_date")
-    # SECURE: sign the certificate so it can be verified later. VULN: unsigned.
-    sig = cu.sign_cert(student_id, title, grade, issued) if MODE == "secure" else None
+    # SECURE: a professor (or admin) issues a certificate only for a course they
+    # teach, only to a student actually enrolled in it, and only a recognised
+    # certificate type — so the title cannot be forged client-side and a
+    # professor/admin can never be given one.
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] not in ("professor", "admin"):
+        return jsonify({"error": "only professors may issue certificates"}), 403
+    cert_type = b.get("cert_type")
+    if cert_type not in db.CERT_TYPES:
+        return jsonify({"error": "unknown certificate type"}), 400
+    course = db.run(conn, "SELECT * FROM courses WHERE id = ?", (b.get("course_id"),))
+    if not course:
+        return jsonify({"error": "unknown course"}), 400
+    course = course[0]
+    if me["role"] == "professor" and course["professor_id"] != me["id"]:
+        return jsonify({"error": "you do not teach this course"}), 403
+    student = db.run(conn, "SELECT * FROM users WHERE id = ?", (b.get("student_id"),))
+    if not student or student[0]["role"] != "student":
+        return jsonify({"error": "certificates can only be issued to students"}), 403
+    student = student[0]
+    if not db.run(conn, "SELECT 1 FROM enrollments WHERE course_id = ? AND student_id = ?",
+                  (course["id"], student["id"])):
+        return jsonify({"error": "that student is not enrolled in this course"}), 400
+
+    title = f"{cert_type}: {course['name']}"
+    gr = db.run(conn, "SELECT grade FROM grades WHERE course_id = ? AND student_id = ?",
+                (course["id"], student["id"]))
+    grade = gr[0]["grade"] if gr else "Completed"
+    issued = b.get("issued_date") or date.today().isoformat()
+    sig = cu.sign_cert(student["id"], title, grade, issued)   # SECURE: signed
     cur = conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
-                       "signature) VALUES (?,?,?,?,?)", (student_id, title, grade, issued, sig))
-
-    if MODE == "secure":
-        # SECURE: anchor the certificate's fingerprint (computed from the row as
-        # stored) so a forged cert will later show as "not on chain". The DB
-        # insert is committed only if the contract accepted the anchor.
-        c = db.run(conn, "SELECT * FROM certifications WHERE id = ?", (cur.lastrowid,))[0]
-        try:
-            eth_ledger.anchor_cert(cu.cert_fingerprint(c["student_id"], c["title"],
-                                                       c["grade"], c["issued_date"]))
-        except eth_ledger.LedgerUnavailable as e:
-            conn.rollback()
-            return jsonify({"error": f"integrity ledger unavailable: {e}"}), 503
-    # VULN: the certificate is neither signed nor anchored.
+                       "signature, issued_by) VALUES (?,?,?,?,?,?)",
+                       (student["id"], title, grade, issued, sig, me["id"]))
+    # SECURE: anchor the fingerprint (from the row as stored); commit only if the
+    # contract accepted it, so a forged cert will later show as "not on chain".
+    c = db.run(conn, "SELECT * FROM certifications WHERE id = ?", (cur.lastrowid,))[0]
+    try:
+        eth_ledger.anchor_cert(cu.cert_fingerprint(c["student_id"], c["title"],
+                                                   c["grade"], c["issued_date"]))
+    except eth_ledger.LedgerUnavailable as e:
+        conn.rollback()
+        return jsonify({"error": f"integrity ledger unavailable: {e}"}), 503
     conn.commit()
     return jsonify({"ok": True}), 201
 

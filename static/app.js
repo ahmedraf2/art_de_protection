@@ -60,10 +60,11 @@ const NAV = [
   { view: "chat", label: "Chat", icon: "💬", roles: ["student", "professor", "admin"] },
   { view: "courses", label: "Courses", icon: "📚", roles: ["student", "professor", "admin"] },
   { view: "search", label: "Directory", icon: "🔍", roles: ["student", "professor", "admin"] },
-  { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student", "professor", "admin"] },
-  { view: "blockchain", label: "Ledger (audit)", icon: "⛓️", roles: ["admin"], secureOnly: true },
-  { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor", "admin"] },
-  { view: "admin", label: "Admin", icon: "⚙️", roles: ["admin"] },
+  { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student"] },
+  { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor"] },
+  { view: "certify", label: "Certify", icon: "🎓", roles: ["professor"] },
+  { view: "users", label: "Users", icon: "👥", roles: ["admin"] },
+  { view: "integrity", label: "Integrity", icon: "🛡️", roles: ["admin"], secureOnly: true },
 ];
 
 async function enterApp() {
@@ -97,7 +98,7 @@ function startIntegrityWatch() {
 }
 async function checkIntegrityBadge() {
   const { status, data } = await api("GET", "/api/admin/integrity");
-  const btn = document.querySelector('#sidebar button[data-view="admin"]');
+  const btn = document.querySelector('#sidebar button[data-view="integrity"]');
   if (!btn) return;
   btn.querySelector(".nav-badge")?.remove();
   const n = (status === 200 && data.available) ? (data.alerts || []).length : 0;
@@ -278,11 +279,13 @@ VIEWS.certifications = async function (params) {
     <tbody>${rows || `<tr><td colspan="6" class="muted">No certifications.</td></tr>`}</tbody></table></div>`;
 };
 
-// ---- blockchain / integrity ledger ----
+// ---- on-chain audit log (rendered inside the admin Integrity page) ----
 function shortHash(h) { return h ? h.slice(0, 10) + "…" + h.slice(-6) : ""; }
 
-VIEWS.blockchain = async function () {
-  const [chain, integ] = await Promise.all([get("/api/blockchain"), get("/api/grades/integrity")]);
+async function renderLedger() {
+  const box = $("ledger-box");
+  if (!box) return;
+  const chain = await get("/api/blockchain");
   let banner;
   if (!chain.available)
     banner = `<div class="chain-banner bad">&#9888; Ledger unavailable — ${esc(chain.error)}</div>`;
@@ -290,17 +293,6 @@ VIEWS.blockchain = async function () {
     banner = `<div class="chain-banner ok">&#9939; Connected to GradeLedger (chain ${chain.chain_id}, block ${chain.block_number}).
       <div class="hashline"><span class="k">contract</span><code>${esc(chain.contract)}</code></div>
       <div class="hashline"><span class="k">issuer</span><code>${esc(chain.issuer)}</code> <span class="muted">— the only key allowed to write</span></div></div>`;
-
-  const rows = (integ.rows || []).map(r => `
-      <tr><td>${esc(r.name)}</td><td>${gradePill(r.db_grade)}</td>
-      <td><code>${shortHash(r.db_hash)}</code></td>
-      <td>${r.chain_hash ? `<code>${shortHash(r.chain_hash)}</code>` : `<span class="muted">not anchored</span>`}</td>
-      <td>${r.ok ? `<span class="pill g">&#10004; matches</span>` : `<span class="pill b">&#10008; TAMPERED</span>`}</td></tr>`).join("");
-  const integrityCard = `<div class="card mt"><h3>Grade integrity check</h3>
-      <p class="muted">The hash of each grade in the database is compared against the hash the issuer anchored in the contract.</p>
-      ${integ.available ? `<table><thead><tr><th>Subject</th><th>Database</th><th>DB hash</th><th>Contract hash</th><th>Status</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="5" class="muted">No grades to check.</td></tr>`}</tbody></table>`
-      : `<p class="pill o">&#9888; unavailable — cannot verify grades right now</p>`}</div>`;
 
   const events = (chain.events || []).slice().reverse().map(e => `
     <div class="block ${esc(e.type)}">
@@ -314,14 +306,11 @@ VIEWS.blockchain = async function () {
       <div class="hashline"><span class="k">tx</span><code>${shortHash(e.tx_hash)}</code></div>
     </div>`).join("");
 
-  $("content").innerHTML = `
-    <div class="page-title">Integrity ledger</div>
-    <p class="page-sub">Grade and certificate hashes anchored in a smart contract on a local Ethereum node. Build: <b>${esc(chain.mode)}</b>.</p>
+  box.innerHTML = `
     ${banner}
-    ${integrityCard}
     <div class="card mt"><h3>Anchored events (${(chain.events || []).length}, newest first)</h3>
       <div class="chain">${events || `<p class="muted">No events.</p>`}</div></div>`;
-};
+}
 
 // ---- chat ----
 VIEWS.chat = async function (params) {
@@ -376,54 +365,124 @@ async function sendChat(to) {
   route();
 }
 
-// ---- gradebook ----
+// ---- roster helpers (shared by the professor's Gradebook and Certify pages) ----
+let ROSTER = [];        // the professor's courses, each with its enrolled students
+function courseOptions(courses) {
+  return courses.map(c => `<option value="${c.course_id}">${esc(c.code)} — ${esc(c.name)}</option>`).join("");
+}
+function fillStudents(prefix) {
+  const course = ROSTER.find(c => c.course_id === Number($(prefix + "-course").value));
+  const students = course ? course.students : [];
+  $(prefix + "-student").innerHTML = students.length
+    ? students.map(s => `<option value="${s.id}">${esc(s.full_name)} (id ${s.id})</option>`).join("")
+    : `<option value="">— no enrolled students —</option>`;
+}
+
+// ---- gradebook (professors: their own courses only) ----
 VIEWS.gradebook = async function () {
-  const mc = await get("/api/my/courses");
+  const r = await get("/api/my/roster");
+  ROSTER = r.courses || [];
   $("content").innerHTML = `
-    <div class="page-title">Gradebook</div><p class="page-sub">Enter or update a student's grade</p>
+    <div class="page-title">Gradebook</div>
+    <p class="page-sub">Enter or update a grade for a student in one of your courses.</p>
     <div class="card" style="max-width:520px">
-      <label>Course ID</label><input id="gb-course" placeholder="course id" />
-      <label>Student ID</label><input id="gb-student" placeholder="student id" />
+      <label>Course</label>
+      <select id="gb-course" onchange="fillStudents('gb')">${courseOptions(ROSTER)}</select>
+      <label>Student</label>
+      <select id="gb-student"></select>
       <label>Grade (/20)</label><input id="gb-grade" placeholder="e.g. 15.5" />
       <div id="gb-msg" class="form-error"></div>
       <button class="btn-primary btn-block" onclick="saveGrade()">Save grade</button>
     </div>
-    <div class="card mt"><h3>${USER.role === "admin" ? "All courses" : "My courses"}</h3>
-      <table><thead><tr><th>ID</th><th>Code</th><th>Name</th></tr></thead><tbody>
-      ${(mc.courses || []).map(x => `<tr><td>${x.id}</td><td>${esc(x.code)}</td><td>${esc(x.name)}</td></tr>`).join("")}
+    <div class="card mt"><h3>My courses</h3>
+      <table><thead><tr><th>Code</th><th>Name</th><th>Students</th></tr></thead><tbody>
+      ${ROSTER.map(x => `<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td>${x.students.length}</td></tr>`).join("")
+        || `<tr><td colspan="3" class="muted">You have no courses.</td></tr>`}
       </tbody></table></div>`;
+  fillStudents("gb");
 };
 async function saveGrade() {
+  const sid = Number($("gb-student").value);
+  if (!sid) { $("gb-msg").style.color = "var(--bad)"; $("gb-msg").textContent = "Select a student."; return; }
   const { status, data } = await api("POST", "/api/grades", {
-    course_id: Number($("gb-course").value), student_id: Number($("gb-student").value), grade: $("gb-grade").value,
+    course_id: Number($("gb-course").value), student_id: sid, grade: $("gb-grade").value,
   });
   $("gb-msg").style.color = status === 200 ? "var(--good)" : "var(--bad)";
   $("gb-msg").textContent = status === 200 ? "Saved." : (data.error || "Failed");
 };
 
-// ---- admin ----
-VIEWS.admin = async function () {
+// ---- users (admin: account list only) ----
+VIEWS.users = async function () {
   $("content").innerHTML = `
-    <div class="page-title">Administration</div><p class="page-sub">Manage users and issue certifications</p>
-    ${MODE === "secure" ? `<div id="integrity-box" class="mt muted">Checking integrity ledger…</div>` : ""}
-    <div class="card"><h3>All users</h3><div id="admin-users" class="mt muted">Loading…</div></div>
-    <div class="card mt" style="max-width:640px"><h3>Issue certification</h3>
-      <div class="grid-2">
-        <div><label>Student ID</label><input id="ic-sid" /></div>
-        <div><label>Title</label><input id="ic-title" /></div>
-        <div><label>Grade</label><input id="ic-grade" /></div>
-        <div><label>Issued date</label><input id="ic-date" placeholder="2026-09-30" /></div>
-      </div>
-      <div id="ic-msg" class="form-error"></div>
-      <button class="btn-primary mt" onclick="issueCert()">Issue &amp; sign</button>
-    </div>`;
+    <div class="page-title">Users</div><p class="page-sub">All accounts in the system</p>
+    <div class="card"><div id="admin-users" class="muted">Loading…</div></div>`;
   const d = await get("/api/admin/users");
   const box = $("admin-users");
   if (!d.users) { box.innerHTML = `<span class="pill b">${esc(d.error || "error")}</span>`; return; }
   const cols = Object.keys(d.users[0]);
   box.innerHTML = `<table><thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead>
     <tbody>${d.users.map(u => `<tr>${cols.map(c => `<td>${esc(u[c])}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
-  if (MODE === "secure") renderIntegrityAlerts();
+};
+
+// ---- certify (professors: issue a signed certificate to an enrolled student) ----
+VIEWS.certify = async function () {
+  const r = await get("/api/my/roster");
+  ROSTER = r.courses || [];
+  const types = r.cert_types || [];
+  $("content").innerHTML = `
+    <div class="page-title">Issue certificate</div>
+    <p class="page-sub">Issue a certificate to a student enrolled in one of your courses.</p>
+    <div class="card" style="max-width:560px">
+      <label>Certificate</label>
+      <select id="cf-type">${types.map(t => `<option>${esc(t)}</option>`).join("")}</select>
+      <label>Course</label>
+      <select id="cf-course" onchange="fillStudents('cf')">${courseOptions(ROSTER)}</select>
+      <label>Student</label>
+      <select id="cf-student"></select>
+      <div id="cf-msg" class="form-error"></div>
+      <button class="btn-primary btn-block" onclick="issueCert()">Issue &amp; sign</button>
+    </div>
+    <div class="card mt"><h3>Certificates you have issued</h3>
+      <div id="cf-issued" class="muted">Loading…</div></div>`;
+  fillStudents("cf");
+  renderIssuedCerts();
+};
+async function renderIssuedCerts() {
+  const d = await get("/api/my/certifications-issued");
+  const rows = d.certifications || [];
+  $("cf-issued").innerHTML = rows.length
+    ? `<table><thead><tr><th>Student</th><th>Certificate</th><th>Grade</th><th>Issued</th></tr></thead>
+       <tbody>${rows.map(c => `<tr><td>${esc(c.student)}</td><td>${esc(c.title)}</td>
+         <td>${esc(c.grade)}</td><td>${esc(c.issued_date)}</td></tr>`).join("")}</tbody></table>`
+    : `<p class="muted">You haven't issued any certificates yet.</p>`;
+}
+async function issueCert() {
+  const cid = Number($("cf-course").value);
+  const course = ROSTER.find(c => c.course_id === cid);
+  const type = $("cf-type").value;
+  const sid = Number($("cf-student").value);
+  if (!sid) { $("cf-msg").style.color = "var(--bad)"; $("cf-msg").textContent = "Select a student."; return; }
+  const { status, data } = await api("POST", "/api/certifications", {
+    cert_type: type, course_id: cid, student_id: sid,
+    // title/issued_date are also sent so the vuln build (which trusts the client,
+    // vuln #6b/#8) still works unchanged; the secure build rebuilds them server-side.
+    title: course ? `${type}: ${course.name}` : type,
+    issued_date: new Date().toISOString().slice(0, 10),
+  });
+  $("cf-msg").style.color = status === 201 ? "var(--good)" : "var(--bad)";
+  $("cf-msg").textContent = status === 201 ? "Issued and signed." : (data.error || "Failed");
+  if (status === 201) renderIssuedCerts();
+}
+
+// ---- integrity (admin: tamper monitor + on-chain audit log, secure build) ----
+VIEWS.integrity = async function () {
+  $("content").innerHTML = `
+    <div class="page-title">Integrity &amp; ledger</div>
+    <p class="page-sub">Live tamper alerts for every grade, and the on-chain audit log.</p>
+    <div id="integrity-box" class="mt muted">Checking integrity ledger…</div>
+    <div id="ledger-box" class="mt"></div>`;
+  renderIntegrityAlerts();
+  renderLedger();
 };
 
 // Admin tamper monitor: shows grades whose DB value no longer matches the ledger,
@@ -473,14 +532,6 @@ async function fixGrade(course_id, student_id) {
   if (status !== 200) { alert((data && data.error) || "Restore failed"); return; }
   await renderIntegrityAlerts();   // alerts clear once the DB matches the ledger again
   checkIntegrityBadge();           // refresh the sidebar badge
-}
-async function issueCert() {
-  const { status, data } = await api("POST", "/api/certifications", {
-    student_id: Number($("ic-sid").value), title: $("ic-title").value,
-    grade: $("ic-grade").value, issued_date: $("ic-date").value,
-  });
-  $("ic-msg").style.color = status === 201 ? "var(--good)" : "var(--bad)";
-  $("ic-msg").textContent = status === 201 ? "Issued." : (data.error || "Failed");
 }
 
 // ---- profile ----

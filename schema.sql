@@ -48,7 +48,9 @@ CREATE TABLE IF NOT EXISTS certifications (
     grade       TEXT,
     issued_date TEXT,
     signature   TEXT,                 -- Ed25519 signature (base64); NULL = unsigned
-    FOREIGN KEY (student_id) REFERENCES users(id)
+    issued_by   INTEGER,              -- the professor/admin who issued it
+    FOREIGN KEY (student_id) REFERENCES users(id),
+    FOREIGN KEY (issued_by) REFERENCES users(id)
 );
 
 -- Private messages between users.

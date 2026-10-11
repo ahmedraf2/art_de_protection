@@ -18,24 +18,8 @@ it work, then repeat on the **secure** build and watch it fail.
 | `bob` | `hunter2` | student | id 5 |
 | `carol` | `qwerty` | student | id 6 |
 
-### The console helper
 
-A few attacks need a request the UI doesn't send (an extra field, a crafted header).
-The easiest "manual" way is the browser **DevTools Console** (F12 → Console) after you
-log in. Paste this once per tab — it sends requests as the logged-in user:
 
-```js
-T = localStorage.token;
-call = (m, p, b) => fetch(p, {
-  method: m,
-  headers: { Authorization: 'Bearer ' + T, ...(b ? {'Content-Type':'application/json'} : {}) },
-  ...(b ? { body: JSON.stringify(b) } : {})
-}).then(r => r.json()).then(j => (console.log(j), j));
-```
-
-Then e.g. `call('GET', '/api/me')`.
-
----
 
 ## 1. SQL injection — login bypass
 
@@ -47,12 +31,9 @@ Then e.g. `call('GET', '/api/me')`.
 
 ## 2. SQL injection — certifications (read other students / dump hashes)
 
-Log in as `alice`. In the Console:
-
-```js
-call('GET', "/api/certifications?student_id=0 OR 1=1");          // every student's certs
-call('GET', "/api/certifications?student_id=0 UNION SELECT id,role,username,password_hash,hash_scheme,NULL,full_name FROM users");
-```
+1) Log in as student user `alice`.
+2) browsing to certification page
+3) student_id query is vulnerable to sql injection
 
 The second returns every user's **MD5 hash** (in the `grade`/`title` fields). In the
 browser you can trigger the same thing from the address bar and the hashes render
@@ -127,10 +108,13 @@ still returns `200`.
 edited token returns **`401`**; and even a genuine student token gets **`403`** here,
 with hashes never returned.
 
-## 4. IDOR — read anyone's private chat
+## 4. IDOR — private chats and student documents
 
-Log in as `alice`. Open **Chat**, click any conversation. The address bar shows
-`…#chat?chat_users[0]=4&chat_users[1]=5`. Change it to:
+Two insecure-direct-object-reference bugs with the same pattern: the object is chosen
+by an id in the request, with no check that you may access it.
+
+**4a — read anyone's private chat.** Log in as `alice`. Open **Chat**, click any
+conversation. The address bar shows `…#chat?chat_users[0]=4&chat_users[1]=5`. Change it to:
 
 ```
 #chat?chat_users[0]=1&chat_users[1]=2
@@ -142,6 +126,13 @@ You now read the private **admin ↔ prof_smith** conversation — including the
 ![Alice (a student) reading the private admin ↔ Dr. Smith chat by editing chat_users[0]=1&chat_users[1]=2 in the URL; the master password is exposed](docs/img/idor-chat-secret.png)
 
 **Secure:** the same URL shows `forbidden`.
+
+**4b — read another student's document.** As `alice`, open another student's document
+by id — in the address bar `#documents?doc=1`, or in the Console
+`call('GET','/api/documents/1')`.
+
+**Vuln:** you see someone else's document (name, e-mail, reference number).
+**Secure:** `forbidden`.
 
 ## 5. Privilege escalation at registration (Burp Suite)
 
@@ -195,7 +186,7 @@ Steps:
 Assignment), but not the textbook form. Strict mass assignment is when the server
 blindly binds *every* field from the request onto the record; here the code reads one
 specific field it should never accept from a client (`role`). The purest mass-assignment
-case in this lab is **[#12 (profile update)](#12-mass-assignment--become-admin-from-your-profile)**,
+case in this lab is **[#9 (profile update)](#9-mass-assignment--become-admin-from-your-profile)**,
 where the vuln writes *any* key you send onto your user row. Registration is the
 narrower, single-field version of the same mistake: trusting client input to set a
 privileged attribute.
@@ -232,8 +223,8 @@ the iterations make each guess ~200,000× slower, so a wordlist attack is imprac
 
 ## 7. Cryptography — signatures & encryption at rest
 
-**7a — forged certificate looks real (vuln).** The vuln build never checks a
-certificate's signature on read, so a forged one shows as **valid**. No DB access needed — inject it as `alice` through the **Course search** box with the stacked-query SQLi (#9):
+**forged certificate looks real (vuln).** The vuln build never checks a
+certificate's signature on read, so a forged one shows as **valid**. No DB access needed — inject it as `alice` through the **Course search** box with a stacked-query SQLi:
 
 ```
 %'; INSERT INTO certifications (student_id,title,grade,issued_date,signature,issued_by) VALUES (4,'PhD in Computer Science','A+','2026-01-01',NULL,1); --
@@ -253,13 +244,6 @@ sqlite3 sms_secure.db "INSERT INTO certifications (student_id,title,grade,issued
 Shows it as **invalid** and **not on chain**
 ![alt text](image.png)
 
-**7b — plaintext messages at rest.** In a shell at the project root:
-
-```bash
-sqlite3 sms_vuln.db   "SELECT body FROM messages LIMIT 3;"   # readable plaintext
-sqlite3 sms_secure.db "SELECT body FROM messages LIMIT 3;"   # AES-GCM ciphertext
-```
-
 ## 8. No integrity anchoring — silent grade tampering
 
 Simulate someone who reached the database (shell at project root):
@@ -270,68 +254,23 @@ sqlite3 sms_secure.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND co
 ```
 
 - **Vuln:** log in as `alice` → Dashboard shows 20/20, nothing flags it.
+
 - **Secure:** `alice`'s Dashboard shows the tampered value struck through in red with
   the **verified** grade beside it, and the average is unchanged. Log in as `admin` →
   the **Integrity** page (and the sidebar badge) shows the tampering, with
   **Restore** / **Restore all from ledger** to rewrite the DB back to the anchored
   value.
 
-## 9. SQL injection — course search (stacked write)
+  After trying to change the grade and going back to dashboard:
+  ![alt text](image-5.png)
 
-Log in as `alice`, open **Course search**.
+  The System admin got a alter about a tampering detected and by pressing "Restore all from ledger" the grade gets back as the original
+  ![alt text](image-6.png)
 
-- **Read / dump hashes** — search for:
-  `' UNION SELECT id, password_hash, role FROM users -- `
-  (hashes appear in the `code` column).
-- **Write a grade with no admin, no Gradebook** — search for:
-  `%'; UPDATE grades SET grade='20.00' WHERE student_id=4 AND course_id=1; -- `
-  The search shows no results, but the Dashboard Math grade is now 20/20.
-
-**Secure:** both return no matching courses and change nothing.
-
-## 10. Stored XSS — announcements
-
-Log in as `prof_jones` (or `admin`). Open **Announcements**, publish one with the
-**message** body:
-
-```html
-<img src=x onerror="alert(document.cookie)">
-```
-
-On the **vuln** build the script runs for everyone who opens Announcements or the
-Dashboard — including the admin. **Secure:** the body shows as literal text and never
-executes.
-
-## 11. IDOR — read another student's document
-
-Log in as `alice`, open **Documents**, submit a request (see #14 for the upload). Your
-request shows a reference like `DOC-2026-0003`. Now open another student's document by
-id — in the address bar:
-
-```
-#documents?doc=1
-```
-
-or in the Console `call('GET','/api/documents/1')`. 
-
-**Vuln:** you see someone else's
-document (name, e-mail, reference).
-
-![alt text](image-2.png)
-
-**Secure:** `forbidden`.
-
-## 12. Mass assignment — become admin from your profile
+## 9. Mass assignment — become admin from your profile
 
 The Profile form only edits name/email/phone/address, but the vuln build writes any
-field you send. As `alice`, in the Console:
-
-```js
-call('POST','/api/profile', {full_name:'Alice Anderson', role:'admin'});
-location.reload();
-```
-
-You're now admin (the **Users** menu appears).
+field you send.
 
 **POC** :
 
@@ -346,53 +285,42 @@ You're now admin (the **Users** menu appears).
 `role` is ignored — you
 stay a student. (the application reads only the fields presented as in the UI)
 
-## 13. Predictable password-reset token — account takeover
+## 10. Unrestricted file upload
 
-On the **login page**, click **Forgot your password?**, enter `carol`, **Send reset
-token**.
-
-- **Vuln:** the token is shown to you (and it's just `md5("reset:carol")[:12]`). Enter
-  a new password → **Set new password** → log in as `carol` with it.
-- **Secure:** no token is shown (it would be e-mailed / is in the server log), and a
-  guessed MD5 token is rejected. Only the random token works, once, for 15 minutes.
-
-You can confirm the vuln token is predictable:
-`python3 -c 'import hashlib;print(hashlib.md5(b"reset:carol").hexdigest()[:12])'`.
-
-## 14. Unrestricted file upload + path traversal + IDOR (documents)
-
-Log in as `alice`, open **Documents**.
-
-**A — upload a non-PDF (stored XSS).** Create `evil.svg`:
+Log in as `alice`, open **Documents**. Create a non-PDF "document" that contains XSS payload:
 
 ```bash
 printf '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(document.domain)</script></svg>' > evil.svg
 ```
 
-Pick a type, choose `evil.svg`, **Submit request**. On the **vuln** build it's
-accepted; click **My upload** → it opens inline and the script runs. **Secure:** the
-upload is rejected ("only PDF files are accepted").
+Pick a type, choose `evil.svg`, **Submit request**.
 
-**B — path traversal (read server secrets).** Note your new document's id (from the
-Console: `call('GET','/api/my/documents')`), then:
+when the administrator approving the document the XSS payload trigger and we could steal his jwt token to access as administrator
+
+**Vuln:** it's accepted and
+stored verbatim — any type, any size, under the filename you sent.
+
+**Secure:**
+rejected with "only PDF files are accepted" (PDF magic bytes + 5 MB cap, stored under
+a random server-generated name).
+
+## 11. Path traversal — read server secrets on download
+
+The download endpoint serves whatever `name=` you pass, joined onto the uploads folder
+with no sanitisation. Note any existing document id (Console:
+`call('GET','/api/my/documents')`, or just use `1`), then:
 
 ```js
-fetch('/api/documents/ID/download?name=../../keys/eth_issuer.key',
+fetch('/api/documents/1/download?name=../../keys/issuer_ed25519.pem',
   {headers:{Authorization:'Bearer '+localStorage.token}}).then(r=>r.text()).then(console.log);
 ```
 
-**Vuln:** it prints the on-chain **issuer private key** (try `../../sms_vuln.db` for
-the whole database). **Secure:** the `name` parameter is ignored.
+**Vuln:** it prints the **Ed25519 certificate signing key** (try `../../sms_vuln.db`
+for the whole database). **Secure:** the `name` parameter is ignored — you only ever
+get the document's own PDF.
 
-**C — IDOR on downloads.** As `bob`, download `alice`'s file:
-`call('GET', …)` won't show the bytes, so use fetch:
-`fetch('/api/documents/<aliceDocId>/download?which=request',{headers:{Authorization:'Bearer '+localStorage.token}})`.
-**Vuln:** `200` (you get it). **Secure:** `403`.
-
-**Admin side (same upload flaw).** Log in as `admin`, open **Documents**, and on a
-pending request click the file picker + **Approve + upload PDF**. The vuln build
-accepts any file for the "issued" document too; the secure build enforces PDF-only +
-random name + attachment download.
+This is the same endpoint the Documents "My upload" button calls (`downloadDoc()`);
+the UI never sends `?name=`, so you add it by hand in the Console/Burp.
 
 ---
 

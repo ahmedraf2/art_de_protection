@@ -108,17 +108,14 @@ anvil keeps no state: **after restarting anvil, restart the secure build with
 | 1 | SQL injection (login bypass) | `POST /api/login` |
 | 2 | SQL injection (certifications) | `GET /api/certifications` |
 | 3 | Broken JWT (no signature check / `alg:none`) | `auth.jwt_decode_vuln` |
-| 4 | IDOR — read anyone's private chat | `GET /api/chat?chat_users[0]=..&chat_users[1]=..` |
+| 4 | IDOR — private chats and student documents | `GET /api/chat?chat_users[0]=..&chat_users[1]=..`, `GET /api/documents/<id>` |
 | 5 | Privilege escalation (client-chosen role) | `POST /api/register` |
 | 6 | Insecure password hashing (unsalted MD5) | `auth.hash_password` |
 | 7 | Missing signature / encryption at rest | certifications & messages |
 | 8 | No integrity anchoring (grade/cert tampering undetected) | `GET /api/grades/integrity`, `GET /api/blockchain` |
-| 9 | SQL injection (course search, stacked write → grade change) | `GET /api/search` |
-| 10 | Stored XSS (announcements feed) | `POST /api/announcements` + client render |
-| 11 | IDOR — read any student's document | `GET /api/documents/<id>` |
-| 12 | Mass assignment (profile update sets `role`) | `POST /api/profile` |
-| 13 | Predictable password-reset token | `POST /api/password-reset/{request,confirm}` |
-| 14 | Unrestricted file upload + path traversal + IDOR | `POST /api/documents`, `GET /api/documents/<id>/download` |
+| 9 | Mass assignment (profile update sets `role`) | `POST /api/profile` |
+| 10 | Unrestricted file upload | `POST /api/documents` |
+| 11 | Path traversal (arbitrary file read on download) | `GET /api/documents/<id>/download?name=..` |
 
 Try every vuln by hand (browser + DevTools): **[MANUAL_TESTING.md](MANUAL_TESTING.md)**.
 Full exploit steps and fixes: **[VULNERABILITIES.md](VULNERABILITIES.md)**.

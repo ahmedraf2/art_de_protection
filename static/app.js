@@ -319,7 +319,7 @@ function recentList(msgs) {
     <div class="snip">${esc(m.body)}</div></div></div>`).join("");
 }
 // A compact "latest news" card for the dashboard. Bodies render through
-// announceBody(), so the stored-XSS pair (#11) also applies here in the vuln build.
+// announceBody(), which escapes them in both builds.
 function announceWidget(items) {
   if (!items.length) return "";
   const top = items.slice(0, 3).map(a => `
@@ -369,12 +369,10 @@ function renderAnnouncements(items) {
       <div class="announce-body">${announceBody(a.body)}</div>
     </div>`).join("");
 }
-// VULN (#11 stored XSS): the vuln build injects the announcement body as RAW HTML,
-// so a <script>/<img onerror=…> saved by any staff account (or by a student who
-// escalated via #5/#13) runs in every reader's browser, including the admin's.
-// SECURE: the body is HTML-escaped on output (output encoding) and renders inert.
+// Announcement bodies are HTML-escaped on output (output encoding) in BOTH builds,
+// so any markup stored in a post renders as inert text instead of executing.
 function announceBody(body) {
-  return MODE === "secure" ? esc(body) : (body || "");
+  return esc(body);
 }
 async function postAnnouncement() {
   const { status, data } = await api("POST", "/api/announcements", {
@@ -491,29 +489,21 @@ async function renderAdminDocuments() {
     const studentUpload = x.request_file
       ? `<button class="btn-ghost sm" onclick="downloadDoc(${x.id},'request')">Student upload</button>` : "";
     const action = x.status === "pending"
-      ? `<input id="apf-${x.id}" type="file" accept="application/pdf" class="inline-file" />
-         <button class="btn-primary sm" onclick="decideDoc(${x.id},'approved')">Approve + upload PDF</button>
+      ? `<button class="btn-primary sm" onclick="decideDoc(${x.id},'approved')">Approve</button>
          <button class="btn-ghost sm" onclick="decideDoc(${x.id},'rejected')">Reject</button>`
-      : `<button class="btn-ghost sm" onclick="nav('documents?doc=${x.id}')">View</button>
-         ${x.issued_file ? `<button class="btn-primary sm" onclick="downloadDoc(${x.id},'issued')">Issued PDF</button>` : ""}`;
+      : `<button class="btn-ghost sm" onclick="nav('documents?doc=${x.id}')">View</button>`;
     return `<tr><td>${esc(x.reference || ("#" + x.id))}</td><td>${esc(x.student)}</td><td>${esc(x.doc_type)}</td>
       <td>${docStatus(x.status)}</td><td>${studentUpload}</td><td>${action}</td></tr>`;
   }).join("");
   $("content").innerHTML = `
     <div class="page-title">Document requests</div>
-    <p class="page-sub">Review the student's upload, then approve by uploading the issued PDF.</p>
+    <p class="page-sub">Review each request, then approve or reject it.</p>
     <div class="card"><table><thead><tr><th>Reference</th><th>Student</th><th>Type</th><th>Status</th><th>Upload</th><th>Action</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="6" class="muted">No requests.</td></tr>`}</tbody></table></div>`;
 }
 async function decideDoc(id, decision) {
   const fd = new FormData();
   fd.append("decision", decision);
-  if (decision === "approved") {
-    const inp = $("apf-" + id);
-    const f = inp && inp.files[0];
-    if (!f) { alert("Attach the issued PDF to approve."); return; }
-    fd.append("document", f);
-  }
   const { status, data } = await apiForm("POST", `/api/admin/documents/${id}/decide`, fd);
   if (status !== 200) { alert((data && data.error) || "Failed"); return; }
   renderAdminDocuments();

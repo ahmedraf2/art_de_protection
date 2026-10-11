@@ -210,8 +210,10 @@ def h_search():
     query = request.args.get("query", "")
 
     if MODE == "vuln":
-        # VULN (#9): the search term is concatenated straight into SQL and run
-        # with a helper that also executes STACKED statements. A classic read works
+        # VULN (stacked-query SQL injection; not in the documented set, but kept
+        # because it is the vehicle used to inject a forged certificate in the
+        # cryptography demo, #7): the search term is concatenated straight into SQL
+        # and run with a helper that also executes STACKED statements. A read works
         # (the result has 3 columns, so a 3-column UNION lines up):
         #   ?query=' UNION SELECT id, password_hash, role FROM users --
         # but because the statement can be stacked, the search box is also a
@@ -775,7 +777,7 @@ def h_grade_integrity():
 
 
 # ==========================================================================
-# Announcements (campus news feed)  —  stored-XSS pair (#10)
+# Announcements (campus news feed)
 # ==========================================================================
 @app.get("/api/announcements")
 @require_auth
@@ -799,12 +801,9 @@ def h_post_announcement():
     title = (b.get("title") or "").strip()
     if not title:
         return jsonify({"error": "a title is required"}), 400
-    # The body is stored exactly as submitted in BOTH builds. The vuln/secure
-    # difference is how the browser RENDERS it (see announceBody() in app.js):
-    #   VULN   #10: the body is injected as raw HTML, so <script>/<img onerror>
-    #               stored here runs in every reader's browser (stored XSS).
-    #   SECURE:     the body is HTML-escaped on output (output encoding).
-    # Storing the raw text is realistic — encoding is an output-time concern.
+    # The body is stored exactly as submitted; the browser HTML-escapes it on
+    # output in both builds (see announceBody() in app.js), so stored markup
+    # renders as inert text. Storing raw text is fine — encoding is an output concern.
     conn.execute("INSERT INTO announcements (author_id, title, body) VALUES (?,?,?)",
                  (me["id"], title, b.get("body") or ""))
     conn.commit()
@@ -812,17 +811,16 @@ def h_post_announcement():
 
 
 # ==========================================================================
-# Administrative documents  —  IDOR pair (#11) + file-upload pair (#14)
+# Administrative documents  —  IDOR (#4b) + file upload (#10) / path traversal (#11)
 # ==========================================================================
 def _save_upload(fs):
     """Store an uploaded file and return the filename to record in the DB.
     Raises ValueError (secure build only) when the file is rejected."""
     if MODE == "vuln":
-        # VULN (#14): the client-supplied filename is trusted (path traversal on
-        # write) and there is NO content-type / extension / size check. Combined
-        # with the inline download below, uploading a .svg/.html "document" that
-        # contains a <script> becomes a stored XSS that fires for whoever opens it
-        # (e.g. the registrar reviewing the request).
+        # VULN (unrestricted file upload #10): the client-supplied filename is
+        # trusted and there is NO content-type / extension / size check, so any file
+        # of any size is stored verbatim under a name the client chose (collisions /
+        # overwrites, and a file written outside uploads/ if the name has path parts).
         name = fs.filename or "upload.bin"
         dest = os.path.join(UPLOAD_DIR, name)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -889,7 +887,7 @@ def h_get_document(doc_id):
         me = load_user(conn, g.ident.get("sub"))
         if me["role"] == "student" and doc["student_id"] != me["id"]:
             return jsonify({"error": "forbidden"}), 403
-    # VULN (IDOR #11): no ownership check — a student can walk /api/documents/<id>
+    # VULN (IDOR #4b): no ownership check — a student can walk /api/documents/<id>
     # (the ids appear in their own request list) and read any other student's
     # attestation / transcript, including name, email and reference number.
     return jsonify({"document": doc})
@@ -908,11 +906,12 @@ def h_download_document(doc_id):
     stored = doc["issued_file"] if which == "issued" else doc["request_file"]
 
     if MODE == "vuln":
-        # VULN (#14): no ownership check (any logged-in user pulls anyone's files —
-        # IDOR), the served path can be overridden with ?name= (directory traversal:
-        #   ?name=../../keys/eth_issuer.key   leaks the on-chain signing key,
-        #   ?name=../../sms_vuln.db           downloads the whole database)
-        # and the file is sent INLINE, so an uploaded .html/.svg runs as stored XSS.
+        # VULN (path traversal #11): the served path can be overridden with ?name=
+        # and is joined onto UPLOAD_DIR with no sanitisation, so it escapes the
+        # directory:
+        #   ?name=../../keys/issuer_ed25519.pem   leaks the cert signing key,
+        #   ?name=../../sms_vuln.db               downloads the whole database.
+        # (The vuln build also skips the ownership check and serves inline.)
         name = request.args.get("name") or stored
         if not name:
             return jsonify({"error": "no file for this document"}), 404
@@ -955,26 +954,16 @@ def h_decide_document(doc_id):
         return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
     if not db.run(conn, "SELECT 1 FROM documents WHERE id = ?", (doc_id,)):
         return jsonify({"error": "document not found"}), 404
-    stored = None
-    if decision == "approved":
-        # The registrar uploads the signed/issued PDF when approving. Same unsafe
-        # vs. safe handling as the student upload (#14).
-        fs = request.files.get("document")
-        if not (fs and fs.filename):
-            return jsonify({"error": "attach the issued PDF to approve"}), 400
-        try:
-            stored = _save_upload(fs)
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 400
-    conn.execute("UPDATE documents SET status = ?, decided_by = ?, decided_at = datetime('now'), "
-                 "issued_file = COALESCE(?, issued_file) WHERE id = ?",
-                 (decision, me["id"], stored, doc_id))
+    # The registrar simply approves or rejects the request; the issued document is
+    # the on-screen attestation, so there is no PDF-upload step here.
+    conn.execute("UPDATE documents SET status = ?, decided_by = ?, decided_at = datetime('now') "
+                 "WHERE id = ?", (decision, me["id"], doc_id))
     conn.commit()
     return jsonify({"ok": True})
 
 
 # ==========================================================================
-# Profile  —  mass-assignment pair (#12) + change password
+# Profile  —  mass-assignment (#9) + change password
 # ==========================================================================
 @app.post("/api/profile")
 @require_auth
@@ -984,7 +973,7 @@ def h_update_profile():
     b = request.get_json(silent=True) or {}
 
     if MODE == "vuln":
-        # VULN (mass assignment #12): every key in the request body is written to
+        # VULN (mass assignment #9): every key in the request body is written to
         # the caller's user row. The profile form only shows name/email/phone/
         # address, but adding e.g. "role":"admin" (or "password_hash":"<md5>") to
         # the JSON in Burp updates those columns too -> privilege escalation.
@@ -1032,11 +1021,11 @@ def h_change_password():
 
 
 # ==========================================================================
-# Password reset  —  predictable-token pair (#13)
+# Password reset  —  predictable-token in the vuln build (not in the documented set)
 # ==========================================================================
 def _reset_token(username):
     if MODE == "vuln":
-        # VULN (#13): the token is a predictable function of the (public) username,
+        # VULN: the token is a predictable function of the (public) username,
         # with no randomness. Anyone who knows a victim's username can compute the
         # same token and reset the victim's password.
         return hashlib.md5(("reset:" + username).encode()).hexdigest()[:12]

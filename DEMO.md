@@ -145,43 +145,25 @@ curl -s -X POST $V/api/register -H 'Content-Type: application/json' \
 
 ---
 
-## 6. Broken access control
+## 6. Cryptography — signatures and encryption
 
-**Break (grades):** as `alice`, self-assign a perfect grade (there is no gradebook in
-the student UI — you call the API directly, which is the point):
+**Signatures (forged diploma):** on `$V`, inject a fake certificate through the
+**Course search** box using the stacked-query SQLi (#9) —
 
-```bash
-curl -s -X POST $V/api/grades -H "Authorization: Bearer $TOK" \
-  -H 'Content-Type: application/json' -d '{"course_id":1,"student_id":4,"grade":"20.00"}'
+```
+%'; INSERT INTO certifications (student_id,title,grade,issued_date,signature,issued_by) VALUES (4,'PhD in Computer Science','A+','2026-01-01',NULL,1); --
 ```
 
-Reload the dashboard → the new grade is there.
-
-**Break (fake diploma):** as `alice`, issue yourself a certificate:
-
-```bash
-curl -s -X POST $V/api/certifications -H "Authorization: Bearer $TOK" \
-  -H 'Content-Type: application/json' \
-  -d '{"student_id":4,"title":"PhD in Computer Science","grade":"A+","issued_date":"2026-09-30"}'
-```
-
-**Fix:** both return `403` on `$S`; a professor can grade only their own course, and
-only admins issue certificates.
-
----
-
-## 7. Cryptography — signatures and encryption
-
-**Signatures (the fake diploma from #6):** on `$V`, load Certifications → the fake
-PhD shows **✔ valid** (no verification). On `$S`, real certs are **✔ valid**; now
-tamper one in the DB and reload:
+load Certifications → the fake PhD shows **✔ valid** (the vuln build never verifies).
+On `$S`, real certs are **✔ valid**; now tamper one in the DB and reload:
 
 ```bash
-sqlite3 sms_secure.db "UPDATE certifications SET grade='A+' WHERE title='Python Developer';"
+sqlite3 sms_secure.db "UPDATE certifications SET grade='20.00' WHERE title LIKE 'Course Completion%';"
 ```
 
-→ that certificate flips to **✘ INVALID** (Ed25519 signature no longer matches).
-Show the public key at `$S/api/pubkey`.
+→ that certificate flips to **✘ INVALID** (Ed25519 signature no longer matches), and
+a cert *inserted* this way is also **not on chain**. Show the public key at
+`$S/api/pubkey`.
 
 **Encryption at rest:** compare the two databases:
 
@@ -195,7 +177,7 @@ API. You need both.
 
 ---
 
-## 8. Blockchain integrity ledger (smart contract)
+## 7. Blockchain integrity ledger (smart contract)
 
 Open **Blockchain** in the sidebar on `$S`. The banner shows the `GradeLedger`
 contract address and the **issuer** — the only key allowed to write. Below it, the

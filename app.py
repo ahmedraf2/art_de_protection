@@ -210,7 +210,7 @@ def h_search():
     query = request.args.get("query", "")
 
     if MODE == "vuln":
-        # VULN (#10): the search term is concatenated straight into SQL and run
+        # VULN (#9): the search term is concatenated straight into SQL and run
         # with a helper that also executes STACKED statements. A classic read works
         # (the result has 3 columns, so a 3-column UNION lines up):
         #   ?query=' UNION SELECT id, password_hash, role FROM users --
@@ -354,71 +354,89 @@ def h_my_issued_certs():
     return jsonify({"certifications": rows})
 
 
+def _prepare_cert(conn, b):
+    """Authorize and validate a certificate-issuance request (BOTH builds).
+
+    A professor (or admin) may issue a certificate only for a course they teach,
+    only to a student actually enrolled in it, and only a recognised certificate
+    type whose grade requirement is met — so the title cannot be forged
+    client-side and a certificate can never be minted by just any user.
+
+    Returns (info, None) on success or (None, (error_dict, status)) on rejection.
+    """
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] not in ("professor", "admin"):
+        return None, ({"error": "only professors may issue certificates"}, 403)
+    cert_type = b.get("cert_type")
+    if cert_type not in db.CERT_TYPES:
+        return None, ({"error": "unknown certificate type"}, 400)
+    course = db.run(conn, "SELECT * FROM courses WHERE id = ?", (b.get("course_id"),))
+    if not course:
+        return None, ({"error": "unknown course"}, 400)
+    course = course[0]
+    if me["role"] == "professor" and course["professor_id"] != me["id"]:
+        return None, ({"error": "you do not teach this course"}, 403)
+    student = db.run(conn, "SELECT * FROM users WHERE id = ?", (b.get("student_id"),))
+    if not student or student[0]["role"] != "student":
+        return None, ({"error": "certificates can only be issued to students"}, 403)
+    student = student[0]
+    if not db.run(conn, "SELECT 1 FROM enrollments WHERE course_id = ? AND student_id = ?",
+                  (course["id"], student["id"])):
+        return None, ({"error": "that student is not enrolled in this course"}, 400)
+
+    title = f"{cert_type}: {course['name']}"
+    gr = db.run(conn, "SELECT grade FROM grades WHERE course_id = ? AND student_id = ?",
+                (course["id"], student["id"]))
+    grade = gr[0]["grade"] if gr else "Completed"
+    # Honour the certificate's grade requirement, so an "Honors Distinction"
+    # cannot be minted for a failing grade.
+    min_grade = db.CERT_MIN_GRADE.get(cert_type)
+    if min_grade is not None:
+        try:
+            gval = float(grade)
+        except (TypeError, ValueError):
+            return None, ({"error": f"'{cert_type}' requires a recorded grade of at "
+                                     f"least {min_grade:g}/20"}, 400)
+        if gval < min_grade:
+            return None, ({"error": f"'{cert_type}' requires at least {min_grade:g}/20 "
+                                     f"(student has {grade}/20)"}, 400)
+    issued = b.get("issued_date") or date.today().isoformat()
+    return {"me": me, "student": student, "title": title, "grade": grade,
+            "issued": issued}, None
+
+
 @app.post("/api/certifications")
 @require_auth
 def h_issue_cert():
     conn = get_db()
     b = request.get_json(silent=True) or {}
 
+    # Authorization + validation run in BOTH builds now: the broken-access-control
+    # flaw that let any logged-in user mint a certificate for anyone, with any
+    # client-supplied title, has been removed.
+    info, err = _prepare_cert(conn, b)
+    if err:
+        body, status = err
+        return jsonify(body), status
+    me, student = info["me"], info["student"]
+    title, grade, issued = info["title"], info["grade"], info["issued"]
+
     if MODE == "vuln":
-        # VULN: no authorization check — any logged-in user can mint a certificate
-        # for anyone, with any client-supplied title, unsigned and unanchored
-        # (vulnerabilities #6b and #8). Behaviour unchanged.
-        student_id, title = b.get("student_id"), b.get("title")
-        grade, issued = b.get("grade"), b.get("issued_date")
+        # VULN (#7): the certificate is stored UNSIGNED and is never anchored, and
+        # on read it is reported "verified" with no check at all — so a cert later
+        # edited directly in the DB still looks genuine.
         conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
                      "signature, issued_by) VALUES (?,?,?,?,?,?)",
-                     (student_id, title, grade, issued, None, g.ident.get("sub")))
+                     (student["id"], title, grade, issued, None, me["id"]))
         conn.commit()
         return jsonify({"ok": True}), 201
 
-    # SECURE: a professor (or admin) issues a certificate only for a course they
-    # teach, only to a student actually enrolled in it, and only a recognised
-    # certificate type — so the title cannot be forged client-side and a
-    # professor/admin can never be given one.
-    me = load_user(conn, g.ident.get("sub"))
-    if not me or me["role"] not in ("professor", "admin"):
-        return jsonify({"error": "only professors may issue certificates"}), 403
-    cert_type = b.get("cert_type")
-    if cert_type not in db.CERT_TYPES:
-        return jsonify({"error": "unknown certificate type"}), 400
-    course = db.run(conn, "SELECT * FROM courses WHERE id = ?", (b.get("course_id"),))
-    if not course:
-        return jsonify({"error": "unknown course"}), 400
-    course = course[0]
-    if me["role"] == "professor" and course["professor_id"] != me["id"]:
-        return jsonify({"error": "you do not teach this course"}), 403
-    student = db.run(conn, "SELECT * FROM users WHERE id = ?", (b.get("student_id"),))
-    if not student or student[0]["role"] != "student":
-        return jsonify({"error": "certificates can only be issued to students"}), 403
-    student = student[0]
-    if not db.run(conn, "SELECT 1 FROM enrollments WHERE course_id = ? AND student_id = ?",
-                  (course["id"], student["id"])):
-        return jsonify({"error": "that student is not enrolled in this course"}), 400
-
-    title = f"{cert_type}: {course['name']}"
-    gr = db.run(conn, "SELECT grade FROM grades WHERE course_id = ? AND student_id = ?",
-                (course["id"], student["id"]))
-    grade = gr[0]["grade"] if gr else "Completed"
-    # SECURE: honour the certificate's grade requirement. The vuln build ignores
-    # this, so an "Honors Distinction" can be minted for a failing grade.
-    min_grade = db.CERT_MIN_GRADE.get(cert_type)
-    if min_grade is not None:
-        try:
-            gval = float(grade)
-        except (TypeError, ValueError):
-            return jsonify({"error": f"'{cert_type}' requires a recorded grade of at "
-                                     f"least {min_grade:g}/20"}), 400
-        if gval < min_grade:
-            return jsonify({"error": f"'{cert_type}' requires at least {min_grade:g}/20 "
-                                     f"(student has {grade}/20)"}), 400
-    issued = b.get("issued_date") or date.today().isoformat()
-    sig = cu.sign_cert(student["id"], title, grade, issued)   # SECURE: signed
+    # SECURE: sign the certificate and anchor its fingerprint in the contract;
+    # commit only if the contract accepted it, so a forged cert shows "not on chain".
+    sig = cu.sign_cert(student["id"], title, grade, issued)
     cur = conn.execute("INSERT INTO certifications (student_id, title, grade, issued_date, "
                        "signature, issued_by) VALUES (?,?,?,?,?,?)",
                        (student["id"], title, grade, issued, sig, me["id"]))
-    # SECURE: anchor the fingerprint (from the row as stored); commit only if the
-    # contract accepted it, so a forged cert will later show as "not on chain".
     c = db.run(conn, "SELECT * FROM certifications WHERE id = ?", (cur.lastrowid,))[0]
     try:
         eth_ledger.anchor_cert(cu.cert_fingerprint(c["student_id"], c["title"],
@@ -437,15 +455,18 @@ def h_set_grade():
     b = request.get_json(silent=True) or {}
     course_id, student_id, grade = b.get("course_id"), b.get("student_id"), b.get("grade")
 
+    # Authorization is enforced in BOTH builds: only an admin, or the professor who
+    # owns this course, may record a grade. (The broken-access-control flaw that
+    # once let any logged-in user — a student — grade themselves has been removed.)
+    me = load_user(conn, g.ident.get("sub"))
+    course = db.run(conn, "SELECT * FROM courses WHERE id = ?", (course_id,))
+    if not me or not course:
+        return jsonify({"error": "bad request"}), 400
+    if not (me["role"] == "admin" or
+            (me["role"] == "professor" and course[0]["professor_id"] == me["id"])):
+        return jsonify({"error": "not authorized to grade this course"}), 403
+
     if MODE == "secure":
-        # SECURE: only an admin, or the professor who owns this course, may grade.
-        me = load_user(conn, g.ident.get("sub"))
-        course = db.run(conn, "SELECT * FROM courses WHERE id = ?", (course_id,))
-        if not me or not course:
-            return jsonify({"error": "bad request"}), 400
-        if not (me["role"] == "admin" or
-                (me["role"] == "professor" and course[0]["professor_id"] == me["id"])):
-            return jsonify({"error": "not authorized to grade this course"}), 403
         # SECURE: validate the grade is a number on the 0–20 scale. The vuln build
         # accepts anything ("abc", "25", "-5") with no validation at all.
         try:
@@ -455,8 +476,6 @@ def h_set_grade():
         if not 0 <= gval <= 20:
             return jsonify({"error": "grade must be between 0 and 20"}), 400
         grade = f"{gval:.2f}"
-    # VULN: no authorization check — any logged-in user (a student!) can set any
-    # grade for any student, including their own — and no validation of the value.
 
     existing = db.run(conn, "SELECT id FROM grades WHERE course_id = ? AND student_id = ?",
                       (course_id, student_id))
@@ -607,19 +626,18 @@ def h_chat_send():
 @require_auth
 def h_admin_users():
     conn = get_db()
+    # Both builds re-check the admin role against the DATABASE rather than trusting
+    # the token's role claim — the broken-access-control flaw here has been removed.
+    me = load_user(conn, g.ident.get("sub"))
+    if not me or me["role"] != "admin":
+        return jsonify({"error": "admins only"}), 403
+    users = db.run(conn, "SELECT * FROM users ORDER BY id")
     if MODE == "vuln":
-        # VULN: trusts the role claim from the (unverified) token, and leaks hashes.
-        if g.ident.get("role") != "admin":
-            return jsonify({"error": "admins only"}), 403
-        users = db.run(conn, "SELECT * FROM users ORDER BY id")
+        # VULN (#7 sensitive-data exposure): the response still includes every
+        # user's password hash and scheme, so the admin view leaks crackable MD5
+        # digests. The secure build never returns secrets.
         return jsonify({"users": [public_user(u, True) for u in users]})
-    else:
-        # SECURE: re-check the role against the database; never return secrets.
-        me = load_user(conn, g.ident.get("sub"))
-        if not me or me["role"] != "admin":
-            return jsonify({"error": "admins only"}), 403
-        users = db.run(conn, "SELECT * FROM users ORDER BY id")
-        return jsonify({"users": [public_user(u) for u in users]})
+    return jsonify({"users": [public_user(u) for u in users]})
 
 
 def _tampered_grades(conn):
@@ -707,7 +725,7 @@ def h_blockchain():
     """Contract address, issuer and every anchored event (any user)."""
     if MODE == "vuln":
         # VULN: this build has no integrity ledger, so nothing ever checks the
-        # grades/certifications tables for tampering (vulnerability #9).
+        # grades/certifications tables for tampering (vulnerability #8).
         return jsonify({"error": "no integrity ledger in this build"}), 404
     # SECURE: the raw ledger explorer (every student's anchors, tx hashes, the
     # contract address) is an operations/audit view, not something a student
@@ -728,7 +746,7 @@ def h_grade_integrity():
     """Compare the caller's grades in the DB against the contract (tamper check)."""
     if MODE == "vuln":
         # VULN: this build has no integrity ledger, so nothing ever checks the
-        # grades/certifications tables for tampering (vulnerability #9).
+        # grades/certifications tables for tampering (vulnerability #8).
         return jsonify({"error": "no integrity ledger in this build"}), 404
     conn = get_db()
     # SECURE: recompute each grade's hash from the DB and compare it with the
@@ -757,7 +775,7 @@ def h_grade_integrity():
 
 
 # ==========================================================================
-# Announcements (campus news feed)  —  stored-XSS pair (#11)
+# Announcements (campus news feed)  —  stored-XSS pair (#10)
 # ==========================================================================
 @app.get("/api/announcements")
 @require_auth
@@ -783,7 +801,7 @@ def h_post_announcement():
         return jsonify({"error": "a title is required"}), 400
     # The body is stored exactly as submitted in BOTH builds. The vuln/secure
     # difference is how the browser RENDERS it (see announceBody() in app.js):
-    #   VULN   #11: the body is injected as raw HTML, so <script>/<img onerror>
+    #   VULN   #10: the body is injected as raw HTML, so <script>/<img onerror>
     #               stored here runs in every reader's browser (stored XSS).
     #   SECURE:     the body is HTML-escaped on output (output encoding).
     # Storing the raw text is realistic — encoding is an output-time concern.
@@ -794,13 +812,13 @@ def h_post_announcement():
 
 
 # ==========================================================================
-# Administrative documents  —  IDOR pair (#12) + file-upload pair (#15)
+# Administrative documents  —  IDOR pair (#11) + file-upload pair (#14)
 # ==========================================================================
 def _save_upload(fs):
     """Store an uploaded file and return the filename to record in the DB.
     Raises ValueError (secure build only) when the file is rejected."""
     if MODE == "vuln":
-        # VULN (#15): the client-supplied filename is trusted (path traversal on
+        # VULN (#14): the client-supplied filename is trusted (path traversal on
         # write) and there is NO content-type / extension / size check. Combined
         # with the inline download below, uploading a .svg/.html "document" that
         # contains a <script> becomes a stored XSS that fires for whoever opens it
@@ -871,7 +889,7 @@ def h_get_document(doc_id):
         me = load_user(conn, g.ident.get("sub"))
         if me["role"] == "student" and doc["student_id"] != me["id"]:
             return jsonify({"error": "forbidden"}), 403
-    # VULN (IDOR #12): no ownership check — a student can walk /api/documents/<id>
+    # VULN (IDOR #11): no ownership check — a student can walk /api/documents/<id>
     # (the ids appear in their own request list) and read any other student's
     # attestation / transcript, including name, email and reference number.
     return jsonify({"document": doc})
@@ -890,7 +908,7 @@ def h_download_document(doc_id):
     stored = doc["issued_file"] if which == "issued" else doc["request_file"]
 
     if MODE == "vuln":
-        # VULN (#15): no ownership check (any logged-in user pulls anyone's files —
+        # VULN (#14): no ownership check (any logged-in user pulls anyone's files —
         # IDOR), the served path can be overridden with ?name= (directory traversal:
         #   ?name=../../keys/eth_issuer.key   leaks the on-chain signing key,
         #   ?name=../../sms_vuln.db           downloads the whole database)
@@ -940,7 +958,7 @@ def h_decide_document(doc_id):
     stored = None
     if decision == "approved":
         # The registrar uploads the signed/issued PDF when approving. Same unsafe
-        # vs. safe handling as the student upload (#15).
+        # vs. safe handling as the student upload (#14).
         fs = request.files.get("document")
         if not (fs and fs.filename):
             return jsonify({"error": "attach the issued PDF to approve"}), 400
@@ -956,7 +974,7 @@ def h_decide_document(doc_id):
 
 
 # ==========================================================================
-# Profile  —  mass-assignment pair (#13) + change password
+# Profile  —  mass-assignment pair (#12) + change password
 # ==========================================================================
 @app.post("/api/profile")
 @require_auth
@@ -966,7 +984,7 @@ def h_update_profile():
     b = request.get_json(silent=True) or {}
 
     if MODE == "vuln":
-        # VULN (mass assignment #13): every key in the request body is written to
+        # VULN (mass assignment #12): every key in the request body is written to
         # the caller's user row. The profile form only shows name/email/phone/
         # address, but adding e.g. "role":"admin" (or "password_hash":"<md5>") to
         # the JSON in Burp updates those columns too -> privilege escalation.
@@ -1014,11 +1032,11 @@ def h_change_password():
 
 
 # ==========================================================================
-# Password reset  —  predictable-token pair (#14)
+# Password reset  —  predictable-token pair (#13)
 # ==========================================================================
 def _reset_token(username):
     if MODE == "vuln":
-        # VULN (#14): the token is a predictable function of the (public) username,
+        # VULN (#13): the token is a predictable function of the (public) username,
         # with no randomness. Anyone who knows a victim's username can compute the
         # same token and reset the victim's password.
         return hashlib.md5(("reset:" + username).encode()).hexdigest()[:12]

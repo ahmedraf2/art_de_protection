@@ -2,8 +2,8 @@
 
 A small student management system (students, professors, admins) built to study
 common web-application security flaws and their fixes: SQL injection, broken JWT
-authentication, IDOR, broken access control, insecure password storage, plus a
-practical look at encryption and digital signatures.
+authentication, IDOR, insecure password storage, plus a practical look at encryption
+and digital signatures.
 
 The application ships in two builds, selected with an environment variable:
 
@@ -54,7 +54,7 @@ cd contracts && forge build && forge test      # compile + run the 3 tests
 docker compose up --build        # anvil + contract build + secure (:3001) + vuln (:3000)
 docker compose down              # stop and remove the containers
 
-python3 scripts/try_attack.py    # play the attacker against both builds (see DEMO.md §8)
+python3 scripts/try_attack.py    # play the attacker against both builds (see DEMO.md §7)
 ```
 
 Only the secure build uses the blockchain; the vuln build starts without anvil.
@@ -110,16 +110,15 @@ anvil keeps no state: **after restarting anvil, restart the secure build with
 | 3 | Broken JWT (no signature check / `alg:none`) | `auth.jwt_decode_vuln` |
 | 4 | IDOR — read anyone's private chat | `GET /api/chat?chat_users[0]=..&chat_users[1]=..` |
 | 5 | Privilege escalation (client-chosen role) | `POST /api/register` |
-| 6 | Broken access control (grading, cert issuance, admin) | `POST /api/grades`, `POST /api/certifications`, `GET /api/admin/users` |
-| 7 | Insecure password hashing (unsalted MD5) | `auth.hash_password` |
-| 8 | Missing signature / encryption at rest | certifications & messages |
-| 9 | No integrity anchoring (grade/cert tampering undetected) | `GET /api/grades/integrity`, `GET /api/blockchain` |
-| 10 | SQL injection (course search, stacked write → grade change) | `GET /api/search` |
-| 11 | Stored XSS (announcements feed) | `POST /api/announcements` + client render |
-| 12 | IDOR — read any student's document | `GET /api/documents/<id>` |
-| 13 | Mass assignment (profile update sets `role`) | `POST /api/profile` |
-| 14 | Predictable password-reset token | `POST /api/password-reset/{request,confirm}` |
-| 15 | Unrestricted file upload + path traversal + IDOR | `POST /api/documents`, `GET /api/documents/<id>/download` |
+| 6 | Insecure password hashing (unsalted MD5) | `auth.hash_password` |
+| 7 | Missing signature / encryption at rest | certifications & messages |
+| 8 | No integrity anchoring (grade/cert tampering undetected) | `GET /api/grades/integrity`, `GET /api/blockchain` |
+| 9 | SQL injection (course search, stacked write → grade change) | `GET /api/search` |
+| 10 | Stored XSS (announcements feed) | `POST /api/announcements` + client render |
+| 11 | IDOR — read any student's document | `GET /api/documents/<id>` |
+| 12 | Mass assignment (profile update sets `role`) | `POST /api/profile` |
+| 13 | Predictable password-reset token | `POST /api/password-reset/{request,confirm}` |
+| 14 | Unrestricted file upload + path traversal + IDOR | `POST /api/documents`, `GET /api/documents/<id>/download` |
 
 Try every vuln by hand (browser + DevTools): **[MANUAL_TESTING.md](MANUAL_TESTING.md)**.
 Full exploit steps and fixes: **[VULNERABILITIES.md](VULNERABILITIES.md)**.

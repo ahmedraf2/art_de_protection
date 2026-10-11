@@ -54,7 +54,17 @@ call('GET', "/api/certifications?student_id=0 OR 1=1");          // every studen
 call('GET', "/api/certifications?student_id=0 UNION SELECT id,role,username,password_hash,hash_scheme,NULL,full_name FROM users");
 ```
 
-The second returns every user's **MD5 hash** (in the `grade`/`title` fields).
+The second returns every user's **MD5 hash** (in the `grade`/`title` fields). In the
+browser you can trigger the same thing from the address bar and the hashes render
+right in the Certifications table:
+
+```
+/#certifications?student_id=0 union select 1,2,password_hash,4,5,6,7,8 from users--
+```
+
+![Certifications page showing every user's MD5 hash, dumped via a UNION SQL injection](docs/img/sqli-certifications-hashes.png)
+
+These hashes are what you crack in #6.
 
 **Secure:** the `OR 1=1` / `UNION` requests return `403` (and a student may read only
 their own id).
@@ -129,6 +139,8 @@ Log in as `alice`. Open **Chat**, click any conversation. The address bar shows
 You now read the private **admin ↔ prof_smith** conversation — including the line
 "the grading portal master password is `Adm1n_Gu@rd14n_2026`".
 
+![Alice (a student) reading the private admin ↔ Dr. Smith chat by editing chat_users[0]=1&chat_users[1]=2 in the URL; the master password is exposed](docs/img/idor-chat-secret.png)
+
 **Secure:** the same URL shows `forbidden`.
 
 ## 5. Privilege escalation at registration (Burp Suite)
@@ -183,7 +195,7 @@ Steps:
 Assignment), but not the textbook form. Strict mass assignment is when the server
 blindly binds *every* field from the request onto the record; here the code reads one
 specific field it should never accept from a client (`role`). The purest mass-assignment
-case in this lab is **[#13 (profile update)](#13-mass-assignment--become-admin-from-your-profile)**,
+case in this lab is **[#12 (profile update)](#12-mass-assignment--become-admin-from-your-profile)**,
 where the vuln writes *any* key you send onto your user row. Registration is the
 narrower, single-field version of the same mistake: trusting client input to set a
 privileged attribute.
@@ -192,55 +204,63 @@ privileged attribute.
 matter what you send — forward the same tampered request and the new account is still a
 plain student.
 
-## 6. Broken access control
+## 6. Insecure password hashing (unsalted MD5)
 
-**6a — a student changes their own grade.** As `alice`:
+You don't *reverse* an MD5 hash (it's one-way) — you **crack** it: hash guesses and
+compare until one matches.
 
-```js
-call('POST','/api/grades', {course_id:1, student_id:4, grade:'20.00'});   // Mathematics
-```
+**Step 1 — get the hashes** by SQL injection: dump them from `/api/certifications`
+(#2, shown above) or blindly from the login injection (#1). You end up with the six
+MD5 digests.
 
-Dashboard now shows 20/20. **Secure:** `403` (not authorized to grade this course).
-
-**6b — a student mints a fake diploma.** As `alice`:
-
-```js
-call('POST','/api/certifications', {student_id:4, title:'PhD in Computer Science', grade:'A+', issued_date:'2026-01-01'});
-```
-
-It appears on the Certifications page as **valid**. **Secure:** `403` (only the
-course's professor may issue, to enrolled students, recognised types only).
-
-**6c — admin list trusts the token.** With the forged admin token from #3,
-`call('GET','/api/admin/users')` returns everyone **including `password_hash`**.
-**Secure:** `403` for anyone who isn't really admin, and hashes are never returned.
-
-## 7. Insecure password hashing (unsalted MD5)
-
-Take any hash leaked in #2/#6c and reverse it — unsalted MD5 is instant:
+**Step 2 — crack them** with `hashcat` or by pasting them into **CrackStation**
+(free, no GPU — it looks them up in precomputed tables):
 
 ```bash
-python3 -c 'import hashlib; print(hashlib.md5(b"admin123").hexdigest())'
-# 0192023a7bbd73250516f069df18b500  == the dumped admin hash
+hashcat -m 0 -a 0 hashes.txt rockyou.txt
 ```
 
+![CrackStation cracking 5 of the 6 leaked MD5 hashes instantly: admin123, hunter2, password1, teach123, qwerty](docs/img/md5-crackstation.png)
+
+It's instant because MD5 is cheap and **unsalted**, so lookups/rainbow tables work and
+identical passwords share a hash. Five of six crack on the spot; the sixth is just not
+in that wordlist.
+
 **Secure:** `sqlite3 sms_secure.db "SELECT hash_scheme,salt FROM users"` shows
-`pbkdf2` with a per-user salt; the hashes don't reverse.
+`pbkdf2` with a per-user salt and 200k iterations — the salt kills rainbow tables and
+the iterations make each guess ~200,000× slower, so a wordlist attack is impractical.
 
-## 8. Cryptography — signatures & encryption at rest
+## 7. Cryptography — signatures & encryption at rest
 
-**8a — forged certificate looks real (vuln).** After #6b, the Certifications page
-marks the fake PhD **valid**. **Secure:** a certificate inserted/edited directly in
-the DB shows **✗ invalid** and **not on chain**.
+**7a — forged certificate looks real (vuln).** The vuln build never checks a
+certificate's signature on read, so a forged one shows as **valid**. No DB access needed — inject it as `alice` through the **Course search** box with the stacked-query SQLi (#9):
 
-**8b — plaintext messages at rest.** In a shell at the project root:
+```
+%'; INSERT INTO certifications (student_id,title,grade,issued_date,signature,issued_by) VALUES (4,'PhD in Computer Science','A+','2026-01-01',NULL,1); --
+```
+
+The search shows no matches, but open **Certifications** → the fake "PhD in Computer Science" is listed and marked **valid**. 
+
+**Secure:** the same search returns nothing
+and inserts nothing (parameterized, single statement); and even a certification inserted directly into the DB shows **✗ invalid** (Ed25519 signature fails) **and not on
+chain** (its fingerprint was never anchored). See #7 in VULNERABILITIES.md for the
+full why/where/fix.
+
+try this on the secure mode
+```bash
+sqlite3 sms_secure.db "INSERT INTO certifications (student_id,title,grade,issued_date,signature,issued_by) VALUES (4,'PhD in Computer Science','17','2026-01-01',NULL,1)"
+```
+Shows it as **invalid** and **not on chain**
+![alt text](image.png)
+
+**7b — plaintext messages at rest.** In a shell at the project root:
 
 ```bash
 sqlite3 sms_vuln.db   "SELECT body FROM messages LIMIT 3;"   # readable plaintext
 sqlite3 sms_secure.db "SELECT body FROM messages LIMIT 3;"   # AES-GCM ciphertext
 ```
 
-## 9. No integrity anchoring — silent grade tampering
+## 8. No integrity anchoring — silent grade tampering
 
 Simulate someone who reached the database (shell at project root):
 
@@ -256,7 +276,7 @@ sqlite3 sms_secure.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND co
   **Restore** / **Restore all from ledger** to rewrite the DB back to the anchored
   value.
 
-## 10. SQL injection — course search (stacked write)
+## 9. SQL injection — course search (stacked write)
 
 Log in as `alice`, open **Course search**.
 
@@ -269,7 +289,7 @@ Log in as `alice`, open **Course search**.
 
 **Secure:** both return no matching courses and change nothing.
 
-## 11. Stored XSS — announcements
+## 10. Stored XSS — announcements
 
 Log in as `prof_jones` (or `admin`). Open **Announcements**, publish one with the
 **message** body:
@@ -282,9 +302,9 @@ On the **vuln** build the script runs for everyone who opens Announcements or th
 Dashboard — including the admin. **Secure:** the body shows as literal text and never
 executes.
 
-## 12. IDOR — read another student's document
+## 11. IDOR — read another student's document
 
-Log in as `alice`, open **Documents**, submit a request (see #15 for the upload). Your
+Log in as `alice`, open **Documents**, submit a request (see #14 for the upload). Your
 request shows a reference like `DOC-2026-0003`. Now open another student's document by
 id — in the address bar:
 
@@ -292,10 +312,16 @@ id — in the address bar:
 #documents?doc=1
 ```
 
-or in the Console `call('GET','/api/documents/1')`. **Vuln:** you see someone else's
-document (name, e-mail, reference). **Secure:** `forbidden`.
+or in the Console `call('GET','/api/documents/1')`. 
 
-## 13. Mass assignment — become admin from your profile
+**Vuln:** you see someone else's
+document (name, e-mail, reference).
+
+![alt text](image-2.png)
+
+**Secure:** `forbidden`.
+
+## 12. Mass assignment — become admin from your profile
 
 The Profile form only edits name/email/phone/address, but the vuln build writes any
 field you send. As `alice`, in the Console:
@@ -305,10 +331,22 @@ call('POST','/api/profile', {full_name:'Alice Anderson', role:'admin'});
 location.reload();
 ```
 
-You're now admin (the **Users** menu appears). **Secure:** `role` is ignored — you
-stay a student.
+You're now admin (the **Users** menu appears).
 
-## 14. Predictable password-reset token — account takeover
+**POC** :
+
+1) go to the profile form and let burp intercept requests , Click "Save Changes"
+![alt text](image-3.png)
+2) add role in the post body and forward the request 
+![alt text](image-4.png)
+3) logging in again gives admin acess
+
+**Secure:** 
+
+`role` is ignored — you
+stay a student. (the application reads only the fields presented as in the UI)
+
+## 13. Predictable password-reset token — account takeover
 
 On the **login page**, click **Forgot your password?**, enter `carol`, **Send reset
 token**.
@@ -321,7 +359,7 @@ token**.
 You can confirm the vuln token is predictable:
 `python3 -c 'import hashlib;print(hashlib.md5(b"reset:carol").hexdigest()[:12])'`.
 
-## 15. Unrestricted file upload + path traversal + IDOR (documents)
+## 14. Unrestricted file upload + path traversal + IDOR (documents)
 
 Log in as `alice`, open **Documents**.
 

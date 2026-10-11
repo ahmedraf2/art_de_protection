@@ -166,6 +166,8 @@ In the browser you don't even need a tool: sign in as `alice`, open **Chat**, cl
 a conversation, then change `chat_users[0]`/`chat_users[1]` in the address bar to
 `1` and `2`. **Burp Intruder** over the two ids enumerates every conversation.
 
+![Alice (a student) reading the private admin ↔ Dr. Smith chat by setting chat_users[0]=1&chat_users[1]=2 in the URL; the message reveals the grading-portal master password](docs/img/idor-chat-secret.png)
+
 **Impact:** total confidentiality loss for private messages — including
 professor/admin chats. Note the query is parameterized (this is an *authorization*
 bug, not SQLi), and encryption at rest does **not** help: the server decrypts before
@@ -204,118 +206,240 @@ curl -s -X POST $B/api/register -H 'Content-Type: application/json' \
 
 ---
 
-## 6. Broken access control (missing function-level authorization)
-
-Three endpoints perform privileged actions without checking the caller's role.
-
-### 6a. Grades — a student can change their own grade
-
-**Where:** `app.py → h_set_grade`.
-
-```bash
-# alice gives herself an A+ in course 1
-curl -s -X POST $B/api/grades -H "Authorization: Bearer $TOK" \
-  -H 'Content-Type: application/json' \
-  -d '{"course_id":1,"student_id":4,"grade":"A+"}'
-```
-
-**Fix:** require admin, or the professor who owns that course.
-
-### 6b. Certifications — a student can issue themselves a fake diploma
-
-**Where:** `app.py → h_issue_cert`.
-
-```bash
-curl -s -X POST $B/api/certifications -H "Authorization: Bearer $TOK" \
-  -H 'Content-Type: application/json' \
-  -d '{"student_id":4,"title":"PhD in Computer Science","grade":"A+","issued_date":"2026-09-30"}'
-```
-
-**Fix:** admins only (and the cert is signed — see #8).
-
-### 6c. Admin user list trusts the token's role claim
-
-**Where:** `app.py → h_admin_users`. Combined with #3 this exposes every user
-(including password hashes). **Fix:** re-check the role from the database and never
-return hashes.
-
-**Verify (all three):** in the secure build each returns `403` for a student; a
-real admin/professor still succeeds where appropriate.
-
----
-
-## 7. Insecure password hashing
+## 6. Insecure password hashing
 
 **Where:** `auth.py → hash_password`. Passwords are stored as **unsalted MD5**.
 
-**Exploit:** the hashes leaked in #2/#6c crack instantly. Every seeded password is
-a fast MD5:
+**You don't "reverse" a hash — you crack it.** MD5 is a one-way function, so there
+is no inverse. Cracking means *guessing*: you hash candidate passwords and compare
+each result with the stolen digest; a match reveals the password. Two things make
+unsalted MD5 catastrophic for this:
+
+- **It's fast.** MD5 is cheap, so a cracker like `hashcat` or John the Ripper tries
+  **billions of candidates per second** on a single GPU. A wordlist (`rockyou.txt`,
+  14M entries) finishes in well under a second, and exhaustive brute force covers
+  all short passwords quickly.
+- **It's unsalted.** Identical passwords produce identical hashes, so an attacker can
+  (a) use **precomputed rainbow tables / online lookups** — the digest is literally
+  Googleable — and (b) crack every user who shares a password in a single pass.
+
+**Step 1 — extract the MD5 hashes with SQL injection.** You never see the hashes
+directly; you pull them out of the database through one of the earlier injections:
+
+- **From `/api/certifications` (#2)** — a UNION select places each user's
+  `password_hash` into a column the page renders, so the hashes show up right in the
+  Certifications table:
+
+  ```
+  /#certifications?student_id=0 union select 1,2,password_hash,4,5,6,7,8 from users--
+  ```
+
+  ![Certifications page listing every user's MD5 password hash, dumped via a UNION-based SQL injection](docs/img/sqli-certifications-hashes.png)
+
+- **Or blindly from the login injection (#1)** — where no output is reflected, extract
+  the hash one character at a time with a boolean-blind payload
+  (`... AND substr(password_hash,1,1)='a'--`), automatable with `sqlmap`.
+
+**Step 2 — crack them with `hashcat` or CrackStation.** The digests are unsalted MD5,
+so you don't need the app at all any more. Paste them into **CrackStation** (free,
+no GPU — it does a lookup against precomputed tables) or run `hashcat`:
 
 ```bash
-python3 -c 'import hashlib;print(hashlib.md5(b"admin123").hexdigest())'
-# 0192023a7bbd73250516f069df18b500  -> matches the dumped hash
-python3 -c 'import hashlib;print(hashlib.md5(b"qwerty").hexdigest())'
-# d8578edf8458ce06fbc5bb76a58c5ca4  -> carol
+# -m 0 = MD5, -a 0 = wordlist attack
+hashcat -m 0 -a 0 hashes.txt rockyou.txt      # cracks admin123, qwerty, … in milliseconds
 ```
 
-Unsalted also means equal passwords produce equal hashes.
+![CrackStation cracking 5 of the 6 leaked MD5 hashes instantly: admin123, hunter2, password1, teach123, qwerty](docs/img/md5-crackstation.png)
 
-**Fix (secure build):** PBKDF2-HMAC-SHA256, per-user random salt, 200k iterations,
-constant-time comparison. **Verify:** `sqlite3 sms_secure.db "SELECT hash_scheme,salt
-FROM users"` shows `pbkdf2` with a salt; the hashes no longer reverse.
+Five of the six fall instantly because they're common passwords; the sixth is only
+"not found" in that wordlist and would still fall to a bigger list or brute force.
+Unsalted also means two users with the same password get the **same** hash, so you
+crack them all in one pass.
 
-> In production prefer `bcrypt`/`scrypt`/`argon2`; PBKDF2 is used here because a
-> KDF is enough to make the point and it needs no extra service.
+**Fix (secure build):** PBKDF2-HMAC-SHA256 with a **per-user random salt**, **200k
+iterations**, and a constant-time comparison. The salt kills rainbow tables and
+forces the attacker to crack every hash separately; the iteration count makes each
+guess ~200,000× slower, so the billions-per-second advantage collapses to a trickle.
+**Verify:** `sqlite3 sms_secure.db "SELECT hash_scheme,salt FROM users"` shows
+`pbkdf2` with a distinct salt per user — the same password now yields different
+hashes, and a wordlist attack is no longer practical.
+
+> In production prefer `bcrypt`/`scrypt`/`argon2` (memory-hard, GPU-resistant);
+> PBKDF2 is used here because a KDF is enough to make the point and needs no extra
+> service.
 
 ---
 
-## 8. Cryptography — encryption at rest and certificate signatures
+## 7. Cryptography — encryption at rest and certificate signatures
 
 Two protections are **absent** in the vuln build and **present** in the secure one.
 
-### 8a. Digital signatures on certifications (Ed25519)
+### 7a. Digital signatures on certifications (Ed25519)
 
-Vuln build stores certificates **unsigned** and never verifies them, so a forged
-certificate (see #6b) is indistinguishable from a real one — the API reports every
-cert as `verified: true`.
+#### How the vuln build is vulnerable
 
-Secure build signs each certificate with the issuer's Ed25519 key
-(`crypto_utils.sign_cert`) and verifies it on read (`verify_cert`). Any change to
-`student_id`, `title`, `grade` or `issued_date` breaks the signature:
+The vuln build stores certificates **unsigned** (`signature` is `NULL`) and, on read,
+**never checks anything** — it simply hard-codes `verified: true`:
 
-```bash
-# secure build: tamper a grade directly in the DB, keep the old signature
-sqlite3 sms_secure.db "UPDATE certifications SET grade='A+' WHERE title='Python Developer';"
-# the API now reports that certificate as  verified: false
+```python
+# app.py -> h_certifications  (VULN branch)
+c["verified"] = True        # signatures are never checked, ledger never consulted
 ```
 
-The public key is served at `GET /api/pubkey` so a third party can verify
-independently. This is the **HMAC / digital-signature** requirement — HMAC-SHA256
-also protects the JWT (see #3).
+So a certificate that was never issued by a professor is indistinguishable from a
+genuine one. And an attacker does **not** need database access to plant one — a plain
+logged-in student can inject it through the **stacked-query SQL injection** in the
+course search (#9):
 
-### 8b. Encryption at rest for messages (AES-256-GCM)
+```bash
+B=http://127.0.0.1:3000
+TOK=$(curl -s $B/api/login -H 'Content-Type: application/json' \
+      -d '{"username":"alice","password":"password1"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# forge a certificate straight into the table, via the search box
+curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" --data-urlencode \
+  "query=%'; INSERT INTO certifications (student_id,title,grade,issued_date,signature,issued_by) VALUES (4,'PhD in Computer Science','A+','2026-01-01',NULL,1); -- "
+
+curl -s -G "$B/api/certifications" -H "Authorization: Bearer $TOK"
+# -> the fake "PhD in Computer Science" is listed with  "verified": true
+```
+
+#### Why the stacked query is possible (and where)
+
+Two things combine:
+
+1. **The query is built by string concatenation** — the search term is pasted
+   straight into SQL (`app.py -> h_search`, VULN branch):
+
+   ```python
+   sql = ("SELECT id, code, name FROM courses "
+          "WHERE name LIKE '%" + query + "%' OR code LIKE '%" + query + "%' ORDER BY code")
+   ```
+
+   The payload `%'; INSERT ... ; -- ` closes the string and the `SELECT`, appends a
+   second statement, and comments out the trailing `%' OR code LIKE ...`.
+
+2. **The helper runs *multiple* statements** (`db.py -> run_raw_multi`). SQLite's
+   `execute()` deliberately refuses more than one statement, which would normally stop
+   a stacked write — but this helper falls back to `executescript()`, which runs them
+   all:
+
+   ```python
+   def run_raw_multi(conn, sql):
+       try:
+           cur = conn.execute(sql)        # refuses >1 statement -> ProgrammingError
+       except sqlite3.ProgrammingError:
+           conn.executescript(sql)        # ... so we run the whole script: the INSERT persists
+           return []
+       ...
+   ```
+
+   That fallback is what turns a read-only search into a **write primitive**.
+
+#### The fix (and where)
+
+Bind the term as a **parameter** and run a **single** statement — the secure build
+of `h_search` uses `db.run` (parameterized), so the input is only ever *data*, never
+SQL, and stacking is impossible (SQLite executes one statement and rejects the rest).
+`run_raw_multi`/`run_raw` are the teaching "unsafe" helpers; real code uses `run`:
+
+```python
+# app.py -> h_search  (SECURE branch)
+rows = db.run(conn,
+    "SELECT id, code, name FROM courses WHERE name LIKE ? OR code LIKE ? ORDER BY code",
+    ("%" + query + "%", "%" + query + "%"))
+```
+
+So in the secure build the injection above returns no rows and inserts nothing. (Full
+treatment of the injection itself is #9.)
+
+#### How the secure build defends the certificate itself
+
+Even if an attacker reached the database directly, two independent checks catch a
+forged or altered certificate:
+
+- **Ed25519 signature (integrity + authenticity).** On issue, the server signs a
+  *canonical* representation of the cert with the issuer's private key
+  (`crypto_utils.sign_cert`, called from `app.py -> h_issue_cert` and `db.py -> _seed`);
+  on read it re-verifies that signature (`crypto_utils.verify_cert`, called from the
+  SECURE branch of `h_certifications`). The signed bytes are a sorted-key JSON of
+  `student_id, title, grade, issued_date` (`crypto_utils.cert_payload`), so changing
+  **any** of those fields — or supplying no signature at all, as the SQLi does —
+  makes verification fail:
+
+  ```bash
+  # secure build: edit a real cert's grade in the DB but keep the old signature
+  sqlite3 sms_secure.db "UPDATE certifications SET grade='20.00' WHERE title LIKE 'Course Completion%';"
+  curl -s -G "$S/api/certifications?student_id=4" -H "Authorization: Bearer $TOKS"
+  # -> that certificate now comes back  "verified": false
+  ```
+
+  The public key is published at `GET /api/pubkey`, so anyone can verify a cert
+  independently, without trusting the server.
+
+- **Blockchain anchoring (tamper-evidence against insertion).** A signature proves
+  *"the issuer signed these bytes"*, but on its own it can't prove a record wasn't
+  **deleted or added wholesale** by someone who can write the DB. So the secure build
+  also anchors each cert's **fingerprint** — `SHA-256(cert_payload)`
+  (`crypto_utils.cert_fingerprint`) — in the `GradeLedger` smart contract at issue
+  time (`eth_ledger.anchor_cert`). On read, `h_certifications` recomputes the
+  fingerprint and asks the contract whether it is anchored
+  (`eth_ledger.is_cert_anchored`), returning `on_chain: true|false`:
+
+  ```bash
+  # the cert injected by SQLi (or any INSERT) was never anchored:
+  # -> "verified": false  AND  "on_chain": false
+  ```
+
+  The ledger is why the forgery can't be hidden: it runs in a **separate process**
+  (not in the SQLite file the attacker tampered with), it is **append-only**, and the
+  contract's `onlyIssuer` modifier rejects any write not signed by the issuer key — so
+  an attacker who can write the database still cannot anchor a matching fingerprint.
+  This is the same mechanism as #8; see it there for the on-chain details.
+
+**In short:** the signature detects *modified* fields; the blockchain detects
+*inserted/removed* records and gives an independent, tamper-evident source of truth.
+The vuln build has neither, which is why a cert injected through a search box sails
+through as `verified: true`. This is the **digital-signature** requirement —
+HMAC-SHA256 similarly protects the JWT (see #3).
+
+### 7b. Encryption at rest for messages (AES-256-GCM)
+
+**Why this belongs under cryptography.** Cryptography provides three things here:
+*integrity & authenticity* (the Ed25519 signatures in #7a), *integrity for the JWT*
+(HMAC-SHA256, #3), and — this part — **confidentiality**. "Encryption at rest" is the
+confidentiality control for stored data: it keeps anyone who can read the raw storage
+(the `.db` file, a backup, a stolen disk, a leaked dump) from reading the contents.
+Storing the message bodies as **plaintext** means that control is simply absent — the
+data has no cryptographic protection at all, so the file *is* the secret.
 
 Vuln build stores message bodies in plaintext — anyone with the DB file reads
-everything:
+everything, including the private admin↔professor chat that holds the master password
+(the same secret the IDOR in #4 exposes over the API):
 
 ```bash
-sqlite3 sms_vuln.db "SELECT subject, body FROM messages LIMIT 3;"   # readable
+sqlite3 sms_vuln.db "SELECT body FROM messages LIMIT 3;"   # readable plaintext
 ```
 
-Secure build encrypts bodies with AES-256-GCM (`crypto_utils.encrypt`) before
-storing them:
+Secure build encrypts each body with **AES-256-GCM** (`crypto_utils.encrypt`) before
+storing it, and decrypts on read. GCM is *authenticated* encryption, so it gives
+confidentiality **and** tamper-detection of the ciphertext; a fresh random 12-byte
+nonce per message means identical texts don't produce identical ciphertext:
 
 ```bash
-sqlite3 sms_secure.db "SELECT subject, body FROM messages LIMIT 3;"  # ciphertext
+sqlite3 sms_secure.db "SELECT body FROM messages LIMIT 3;"  # base64 AES-GCM ciphertext
 ```
+
+The key lives in `keys/aes.key` (outside the database), so reading the DB file alone
+reveals nothing.
 
 **Defense-in-depth note:** encryption at rest protects the *database file*; it does
-**not** fix the IDOR in #4, because the server decrypts before responding. You need
-both access control *and* encryption.
+**not** fix the IDOR in #4, because the server decrypts before responding over the
+API. You need both access control *and* encryption.
 
 ---
 
-## 9. No integrity anchoring — grade/certificate tampering goes undetected
+## 8. No integrity anchoring — grade/certificate tampering goes undetected
 
 **Where:** `app.py → h_set_grade`, `h_issue_cert`, `h_certifications`,
 `h_grade_integrity`; ledger in `eth_ledger.py` + `contracts/src/GradeLedger.sol`.
@@ -354,6 +478,8 @@ the issuer can write, and verify on read.
 
   A certificate inserted straight into the DB comes back `verified:false` **and**
   `on_chain:false`; a genuine one is `on_chain:true`.
+
+![alt text](image-1.png)
 - *The ledger itself cannot be fixed up* by the attacker: it lives in a separate
   process (not in the SQLite file), and the contract's `onlyIssuer` modifier
   rejects every write not signed by `keys/eth_issuer.key`:
@@ -365,7 +491,7 @@ the issuer can write, and verify on read.
   }
   ```
 
-  A write from any other account reverts with `NotIssuer()` (see DEMO §8).
+  A write from any other account reverts with `NotIssuer()` (see DEMO §7).
 
 **Verify:** `python3 scripts/try_attack.py` runs the same attacks against both
 builds and prints the result side by side. By hand: the vuln build has no
@@ -379,7 +505,7 @@ against attackers who can write to the *database*, which is the threat here.
 
 ---
 
-## 10. SQL injection — course search (stacked write)
+## 9. SQL injection — course search (stacked write)
 
 **Where:** `app.py → h_search` (`GET /api/search?query=`), the **Course search**
 page. The search term is concatenated into a `LIKE` pattern and run with
@@ -420,7 +546,7 @@ curl -s -G "$B/api/search" -H "Authorization: Bearer $TOK" \
 In the browser: log in as `alice` / `password1`, open **Course search**, and paste
 the Exploit B string into the search field. The search shows no matches, but the
 Math grade on the Dashboard is now 20/20. The vuln build has no ledger, so (as in
-#9) nothing detects it.
+#8) nothing detects it.
 
 **Fix (secure build):** bind the term as a parameter — it is then only ever data,
 never SQL — and the query stays a single statement, so stacking is impossible:
@@ -433,11 +559,11 @@ rows = db.run(conn,
 
 **Verify:** on the secure build the same Exploit B payload returns no results and
 leaves the grade at 14.00; `/api/grades/integrity` still shows `ok:true`. (Even if
-an attacker reached the database directly, the #9 ledger would flag the change.)
+an attacker reached the database directly, the #8 ledger would flag the change.)
 
 ---
 
-## 11. Stored XSS — announcements feed
+## 10. Stored XSS — announcements feed
 
 **Where:** `app.py → h_post_announcement` (storage) and `static/app.js → announceBody`
 (output). Staff post to a shared news feed; the body is stored verbatim and rendered
@@ -448,7 +574,7 @@ for every reader on the Announcements page and the dashboard widget.
 function announceBody(body) { return MODE === "secure" ? esc(body) : (body || ""); }
 ```
 
-**Exploit** — as a professor (or a student who escalated via #5/#13), post an
+**Exploit** — as a professor (or a student who escalated via #5/#12), post an
 announcement whose body is a script. It runs in every reader's browser, including
 the admin's:
 
@@ -468,7 +594,7 @@ shows as literal text in the secure build and never executes.
 
 ---
 
-## 12. IDOR — read any student's document
+## 11. IDOR — read any student's document
 
 **Where:** `app.py → h_get_document` (`GET /api/documents/<id>`). A student requests
 official documents (attestation, transcript); an approved one is viewable by id, with
@@ -493,7 +619,7 @@ if me["role"] == "student" and doc["student_id"] != me["id"]:
 
 ---
 
-## 13. Mass assignment — profile update sets privileged columns
+## 12. Mass assignment — profile update sets privileged columns
 
 **Where:** `app.py → h_update_profile` (`POST /api/profile`). The vuln build writes
 every key in the body to the user row; the form only exposes name/email/phone/address.
@@ -519,7 +645,7 @@ build):** write only an explicit whitelist (`full_name, email, phone, address`);
 
 ---
 
-## 14. Predictable password-reset token
+## 13. Predictable password-reset token
 
 **Where:** `app.py → _reset_token` / `h_reset_request` / `h_reset_confirm`.
 
@@ -548,7 +674,7 @@ only the random token from the server log works, once.
 
 ---
 
-## 15. Unrestricted file upload + path traversal + IDOR (documents)
+## 14. Unrestricted file upload + path traversal + IDOR (documents)
 
 **Where:** `app.py → _save_upload`, `h_request_document`, `h_decide_document`,
 `h_download_document`. Students attach a PDF to a document request; the registrar
@@ -604,10 +730,10 @@ returns `403`; a valid PDF downloads as an attachment.
 Three existing flaws were moved off-screen so they're found the way they would be in
 a real engagement, without changing whether they exist:
 
-- **#2/#6c credential leak** — the vuln `GET /api/admin/users` still returns
-  `password_hash`, but the Users page no longer renders it; you find it in the
-  Network tab / Burp, not in a visible column.
-- **IDOR recon (#4, #12)** — internal ids are no longer printed in the UI (directory,
+- **Credential leak via the admin user list (#7)** — the vuln `GET /api/admin/users`
+  still returns `password_hash` (sensitive-data exposure), but the Users page no
+  longer renders it; you find it in the Network tab / Burp, not in a visible column.
+- **IDOR recon (#4, #11)** — internal ids are no longer printed in the UI (directory,
   dashboards, dropdowns, profile). They still appear in JSON and in the chat URL,
   which is the normal recon path.
 - **#5 role escalation** — the disabled "Account type" field was removed from the
@@ -625,16 +751,15 @@ a real engagement, without changing whether they exist:
 | 3 | JWT not verified / `alg:none` | pin alg, verify HMAC, check exp |
 | 4 | IDOR on chat conversations | ownership/role check |
 | 5 | Privilege escalation at registration | server-assigned role |
-| 6 | Broken access control (grades/certs/admin) | server-side role checks |
-| 7 | Unsalted MD5 passwords | PBKDF2 + salt |
-| 8 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |
-| 9 | No integrity anchoring (tampering undetected) | issuer-only smart contract: anchor hashes on write, verify on read |
-| 10 | SQLi in course search (stacked write → grade change) | parameterized query, single statement |
-| 11 | Stored XSS in announcements | HTML-escape on output |
-| 12 | IDOR on documents | ownership/role check |
-| 13 | Mass assignment on profile update | server-side field whitelist |
-| 14 | Predictable password-reset token | random, hashed, single-use, expiring token |
-| 15 | Unrestricted upload + path traversal + IDOR (documents) | PDF-only + random name, fixed id/path, attachment, authz |
+| 6 | Unsalted MD5 passwords | PBKDF2 + salt |
+| 7 | No signatures / no encryption at rest | Ed25519 signatures + AES-GCM |
+| 8 | No integrity anchoring (tampering undetected) | issuer-only smart contract: anchor hashes on write, verify on read |
+| 9 | SQLi in course search (stacked write → grade change) | parameterized query, single statement |
+| 10 | Stored XSS in announcements | HTML-escape on output |
+| 11 | IDOR on documents | ownership/role check |
+| 12 | Mass assignment on profile update | server-side field whitelist |
+| 13 | Predictable password-reset token | random, hashed, single-use, expiring token |
+| 14 | Unrestricted upload + path traversal + IDOR (documents) | PDF-only + random name, fixed id/path, attachment, authz |
 
 **Secure-build business rules** (flaws only in the vuln build, not numbered attacks):
 grades must be numeric and within 0–20; certificates enforce a minimum grade

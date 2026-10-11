@@ -412,8 +412,12 @@ async function runSearch() {
 
 // ---- certifications ----
 VIEWS.certifications = async function (params) {
-  const sid = params.get("student_id");
-  const d = await get("/api/certifications" + (sid ? "?student_id=" + encodeURIComponent(sid) : ""));
+  let sid = params.get("student_id");
+  if (sid === null) {            // pin your own id into the URL (recon surface for #2)
+    location.hash = "certifications?student_id=" + USER.id;
+    return;
+  }
+  const d = await get("/api/certifications?student_id=" + encodeURIComponent(sid));
   const ledger = MODE === "secure";      // the Ledger column only exists in the secure build
   const ledgerCell = (c) => {
     if (c.on_chain === null) return `<span class="pill o">&#9888; unavailable</span>`;
@@ -630,8 +634,13 @@ async function renderConversation(u0, u1) {
       <div class="card"><p class="pill b">${esc(data.error || "Error")}</p></div>`;
     return;
   }
+  // The viewer of this conversation is chat_users[0]: their messages are "mine"
+  // (green, right). chat_users[1] is the other party (grey, left). This is driven
+  // by the URL, so swapping chat_users[0]/[1] swaps the sides — it does NOT depend
+  // on who is logged in (that's what makes the #4 IDOR view readable from either side).
+  const self = Number(u0);
   const bubbles = (data.messages || []).map(m => {
-    const mine = m.sender_id === data.me;
+    const mine = m.sender_id === self;
     return `<div class="bubble-row ${mine ? "mine" : ""}"><div class="bubble">
       <div class="meta"><b>${esc(m.sender_name)}</b> · ${esc(fmtDate(m.created_at))}</div>${esc(m.body)}</div></div>`;
   }).join("");

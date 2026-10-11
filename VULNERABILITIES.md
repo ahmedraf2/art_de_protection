@@ -54,7 +54,7 @@ change the statement. **Verify:** the payload now returns `401`.
 
 ---
 
-## 2. SQL injection — certifications
+## 2. SQL injection (IDOR too) — certifications
 
 **Where:** `app.py → h_certifications`. The `student_id` query parameter is
 concatenated into a numeric context.

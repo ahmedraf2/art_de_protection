@@ -59,25 +59,63 @@ The second returns every user's **MD5 hash** (in the `grade`/`title` fields).
 **Secure:** the `OR 1=1` / `UNION` requests return `403` (and a student may read only
 their own id).
 
-## 3. Broken JWT — forge an admin token
+## 3. Broken JWT — forge an admin token (Burp Suite)
 
-The vuln build never checks the signature. Log in as `alice`, then in the Console
-rebuild your own token with `role: admin` and reload:
+The vuln build decodes the JWT but **never verifies the signature**
+(`jwt_decode_vuln`, [app.py:64-65](app.py#L64-L65)), and the admin endpoint trusts the
+`role` claim straight from the token ([app.py:611-612](app.py#L611-L612)). So you can
+flip `role` to `admin` in your own token and the server believes it.
 
-```js
-const [h, p] = localStorage.token.split('.');
-const pl = JSON.parse(atob(p.replace(/-/g,'+').replace(/_/g,'/')));
-pl.role = 'admin';
-const b64 = o => btoa(JSON.stringify(o)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-localStorage.token = `${h}.${b64(pl)}.anything`;   // signature ignored in vuln
-location.reload();
-```
+Point Firefox at Burp (Proxy listening on `127.0.0.1:8080`) and log in as **alice** /
+`password1`.
 
-You now have the **Users** and (secure build only) admin menus. Confirm with
-`call('GET','/api/admin/users')`.
+1. **Grab an authenticated request.** In **Proxy → HTTP history**, find any request
+   carrying an `Authorization: Bearer …` header — `GET /api/me` is sent right after
+   login. Right-click it → **Send to Repeater**.
+2. **Aim it at the admin endpoint.** In Repeater, change the first line to:
+   ```
+   GET /api/admin/users HTTP/1.1
+   ```
+   **Send.** You get **`403 {"error":"admins only"}`**. That already proves the token is
+   accepted — you're authenticated, just not admin yet. The signature bought the server
+   nothing; it only needs the `role` claim to say `admin`.
 
-**Secure:** the forged token returns `401` everywhere (sign out / log back in to get a
-real token).
+   ![Repeater: GET /api/admin/users with alice's real token returns 403 "admins only"](docs/img/jwt-01-baseline-403.png)
+
+3. **Forge the role.** Open the **JSON Web Token** tab (Burp's JWT editor / the "JWT
+   Editor" extension). The payload reads:
+   ```json
+   { "sub": 4, "username": "alice", "role": "student", "iat": …, "exp": … }
+   ```
+   Change `"role": "student"` → `"role": "admin"`. **Leave the signature alone — do NOT
+   re-sign.**
+
+   ![JSON Web Token tab: payload edited to "role": "admin", signature left untouched](docs/img/jwt-02-editor-role-admin.png)
+
+4. **Send.** Now **`200 OK`** and the full user list, **including every
+   `password_hash`**:
+   ```json
+   { "users": [ { "id":1, "username":"admin", "role":"admin",
+                  "password_hash":"0192023a7bbd73250516f069df18b500", … }, … ] }
+   ```
+
+   ![Repeater: forged admin token returns 200 OK with every user and password_hash](docs/img/jwt-03-200-users-hashes.png)
+
+**The signature does not matter.** The vuln build never checks it, so a valid signature
+is not required — and neither is *any* signature: delete the whole third segment
+(everything after the last `.`, leaving just the trailing dot) and the same request
+still returns `200`.
+
+![Repeater: same request with the signature segment removed still returns 200 OK](docs/img/jwt-04-no-signature-200.png)
+
+> To forge the **whole UI** into an admin session (not just this one endpoint), also
+> change `"sub": 4` to `"sub": 1` (admin's id). The app's `GET /api/me` loads the user
+> by `sub` ([app.py:183-186](app.py#L183-L186)), so the sidebar and dashboard turn
+> admin. For dumping `/api/admin/users`, changing `role` alone is enough.
+
+**Secure build (:3001):** the signature *is* verified (`jwt_decode_secure`), so the
+edited token returns **`401`**; and even a genuine student token gets **`403`** here,
+with hashes never returned.
 
 ## 4. IDOR — read anyone's private chat
 
@@ -93,19 +131,66 @@ You now read the private **admin ↔ prof_smith** conversation — including the
 
 **Secure:** the same URL shows `forbidden`.
 
-## 5. Privilege escalation at registration
+## 5. Privilege escalation at registration (Burp Suite)
 
-The sign-up form never sends a role, but the vuln build accepts one. In the Console
-(you don't even need to be logged in):
+The sign-up form only sends `full_name`, `username`, `email`, `password` — never a
+role. But the vuln build reads a `role` from the request body if one is present, and
+trusts it:
 
-```js
-fetch('/api/register', {method:'POST', headers:{'Content-Type':'application/json'},
-  body: JSON.stringify({username:'hacker', password:'x', role:'admin'})}).then(r=>r.json()).then(console.log);
+```python
+# app.py:140-143
+if MODE == "vuln":
+    role = b.get("role", "student")   # VULN: "student" is only the default — a client-supplied role wins
+else:
+    role = "student"                  # SECURE: server fixes the role, body ignored
+
+# app.py:146-148 — whatever `role` ends up being is written straight into the new row:
+conn.execute("INSERT INTO users (..., role, ...) VALUES (?,?,?,?,?,?,?)",
+             (username, h, salt, scheme, role, b.get("full_name"), b.get("email")))
 ```
 
-Log in as `hacker`/`x` → you're an **admin**.
+So a new account is `student` **only because the form doesn't send `role`** — that's
+the `b.get("role", "student")` default. Add the field yourself and you choose your own
+role.
 
-**Secure:** the new account comes back as `student` regardless of what you send.
+Steps:
+
+1. **Proxy → Intercept → "Intercept is on"**, with Firefox pointed at Burp.
+2. On the **registration page**, fill it in (e.g. Full name `ahmed`, Username `ahmed`,
+   Email `ahmed@campus.edu`, Password `ahmed123`) and click **Create account**.
+3. Burp catches **`POST /api/register`**. The JSON body has no role:
+   ```json
+   { "full_name":"ahmed", "username":"ahmed", "email":"ahmed@campus.edu", "password":"ahmed123" }
+   ```
+
+   ![Proxy intercept: POST /api/register captured, body has no role field](docs/img/register-01-intercept.png)
+
+4. **Add the role** — edit the body to:
+   ```json
+   { "full_name":"ahmed", "username":"ahmed", "email":"ahmed@campus.edu", "password":"ahmed123", "role":"admin" }
+   ```
+   **Forward** the request.
+
+   ![Intercepted request edited to add "role":"admin" before forwarding](docs/img/register-02-add-role.png)
+
+5. **Log in** as `ahmed` / `ahmed123`. The dashboard greets you with **"Administrator
+   dashboard"** and the admin menus (Users, Documents, Integrity) appear — the new
+   account is a full admin.
+
+   ![Logged in as the new ahmed account showing the Administrator dashboard](docs/img/register-03-admin-dashboard.png)
+
+**Is this "mass assignment"?** Same family (OWASP: Broken Access Control / Mass
+Assignment), but not the textbook form. Strict mass assignment is when the server
+blindly binds *every* field from the request onto the record; here the code reads one
+specific field it should never accept from a client (`role`). The purest mass-assignment
+case in this lab is **[#13 (profile update)](#13-mass-assignment--become-admin-from-your-profile)**,
+where the vuln writes *any* key you send onto your user row. Registration is the
+narrower, single-field version of the same mistake: trusting client input to set a
+privileged attribute.
+
+**Secure build (:3001):** `role` is forced to `student` ([app.py:143](app.py#L143)) no
+matter what you send — forward the same tampered request and the new account is still a
+plain student.
 
 ## 6. Broken access control
 

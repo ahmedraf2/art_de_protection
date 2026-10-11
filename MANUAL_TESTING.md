@@ -307,16 +307,20 @@ a random server-generated name).
 ## 11. Path traversal — read server secrets on download
 
 The download endpoint serves whatever `name=` you pass, joined onto the uploads folder
-with no sanitisation. Note any existing document id (Console:
-`call('GET','/api/my/documents')`, or just use `1`), then:
+with no sanitisation. Note any existing document id
 
-```js
-fetch('/api/documents/1/download?name=../../keys/issuer_ed25519.pem',
-  {headers:{Authorization:'Bearer '+localStorage.token}}).then(r=>r.text()).then(console.log);
-```
+Steps:
 
-**Vuln:** it prints the **Ed25519 certificate signing key** (try `../../sms_vuln.db`
-for the whole database). **Secure:** the `name` parameter is ignored — you only ever
+1) when Student views his uploaded document , a request is sent that retrieve the pdf in the response 
+![alt text](image-7.png)
+
+2) checking which query paramter wasn't vulnerable but brute forcing multiple commune queries , `?name` made the response different, which indicates it is processed by the api
+![alt text](image-8.png)
+3) Found out it was vulnerable to path traversal which leads to local file disclosure
+ ![alt text](image-9.png)
+
+
+**Secure:** the `name` parameter is ignored — you only ever
 get the document's own PDF.
 
 This is the same endpoint the Documents "My upload" button calls (`downloadDoc()`);

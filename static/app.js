@@ -434,7 +434,7 @@ VIEWS.certifications = async function (params) {
     <tbody>${rows || `<tr><td colspan="6" class="muted">No certifications.</td></tr>`}</tbody></table></div>`;
 };
 
-// ---- documents (students request; admin approves; IDOR on viewing #12) ----
+// ---- documents (students request; admin approves/rejects; IDOR on viewing #4b) ----
 VIEWS.documents = async function (params) {
   const docId = params.get("doc");
   if (docId) return renderDocument(docId);

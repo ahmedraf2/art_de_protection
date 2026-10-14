@@ -1,8 +1,6 @@
 # Manual testing guide — try every vulnerability by hand
 
-This walks through all **15** vulnerabilities using the browser (and its DevTools
-console) against the running lab. For each one: do it on the **vuln** build and watch
-it work, then repeat on the **secure** build and watch it fail.
+This walks through all vulnerabilities using the browser (and burp suite) against the running app. For each one: all of them work on the **vuln** build and the fix on **secure** build and.
 
 - Vulnerable build: **http://127.0.0.1:3000**
 - Secure build: **http://127.0.0.1:3001**
@@ -43,7 +41,9 @@ right in the Certifications table:
 /#certifications?student_id=0 union select 1,2,password_hash,4,5,6,7,8 from users--
 ```
 
+
 ![Certifications page showing every user's MD5 hash, dumped via a UNION SQL injection](docs/img/sqli-certifications-hashes.png)
+
 
 These hashes are what you crack in #6.
 
@@ -71,7 +71,9 @@ Point Firefox at Burp (Proxy listening on `127.0.0.1:8080`) and log in as **alic
    accepted — you're authenticated, just not admin yet. The signature bought the server
    nothing; it only needs the `role` claim to say `admin`.
 
+
    ![Repeater: GET /api/admin/users with alice's real token returns 403 "admins only"](docs/img/jwt-01-baseline-403.png)
+
 
 3. **Forge the role.** Open the **JSON Web Token** tab (Burp's JWT editor / the "JWT
    Editor" extension). The payload reads:
@@ -81,7 +83,9 @@ Point Firefox at Burp (Proxy listening on `127.0.0.1:8080`) and log in as **alic
    Change `"role": "student"` → `"role": "admin"`. **Leave the signature alone — do NOT
    re-sign.**
 
+
    ![JSON Web Token tab: payload edited to "role": "admin", signature left untouched](docs/img/jwt-02-editor-role-admin.png)
+
 
 4. **Send.** Now **`200 OK`** and the full user list, **including every
    `password_hash`**:
@@ -90,14 +94,18 @@ Point Firefox at Burp (Proxy listening on `127.0.0.1:8080`) and log in as **alic
                   "password_hash":"0192023a7bbd73250516f069df18b500", … }, … ] }
    ```
 
+
    ![Repeater: forged admin token returns 200 OK with every user and password_hash](docs/img/jwt-03-200-users-hashes.png)
+
 
 **The signature does not matter.** The vuln build never checks it, so a valid signature
 is not required — and neither is *any* signature: delete the whole third segment
 (everything after the last `.`, leaving just the trailing dot) and the same request
 still returns `200`.
 
+
 ![Repeater: same request with the signature segment removed still returns 200 OK](docs/img/jwt-04-no-signature-200.png)
+
 
 > To forge the **whole UI** into an admin session (not just this one endpoint), also
 > change `"sub": 4` to `"sub": 1` (admin's id). The app's `GET /api/me` loads the user
@@ -123,7 +131,9 @@ conversation. The address bar shows `…#chat?chat_users[0]=4&chat_users[1]=5`. 
 You now read the private **admin ↔ prof_smith** conversation — including the line
 "the grading portal master password is `Adm1n_Gu@rd14n_2026`".
 
+
 ![Alice (a student) reading the private admin ↔ Dr. Smith chat by editing chat_users[0]=1&chat_users[1]=2 in the URL; the master password is exposed](docs/img/idor-chat-secret.png)
+
 
 **Secure:** the same URL shows `forbidden`.
 
@@ -166,7 +176,9 @@ Steps:
    { "full_name":"ahmed", "username":"ahmed", "email":"ahmed@campus.edu", "password":"ahmed123" }
    ```
 
+
    ![Proxy intercept: POST /api/register captured, body has no role field](docs/img/register-01-intercept.png)
+
 
 4. **Add the role** — edit the body to:
    ```json
@@ -174,22 +186,18 @@ Steps:
    ```
    **Forward** the request.
 
+
    ![Intercepted request edited to add "role":"admin" before forwarding](docs/img/register-02-add-role.png)
+
 
 5. **Log in** as `ahmed` / `ahmed123`. The dashboard greets you with **"Administrator
    dashboard"** and the admin menus (Users, Documents, Integrity) appear — the new
    account is a full admin.
 
+
    ![Logged in as the new ahmed account showing the Administrator dashboard](docs/img/register-03-admin-dashboard.png)
 
-**Is this "mass assignment"?** Same family (OWASP: Broken Access Control / Mass
-Assignment), but not the textbook form. Strict mass assignment is when the server
-blindly binds *every* field from the request onto the record; here the code reads one
-specific field it should never accept from a client (`role`). The purest mass-assignment
-case in this lab is **[#9 (profile update)](#9-mass-assignment--become-admin-from-your-profile)**,
-where the vuln writes *any* key you send onto your user row. Registration is the
-narrower, single-field version of the same mistake: trusting client input to set a
-privileged attribute.
+
 
 **Secure build (:3001):** `role` is forced to `student` ([app.py:143](app.py#L143)) no
 matter what you send — forward the same tampered request and the new account is still a
@@ -211,7 +219,9 @@ MD5 digests.
 hashcat -m 0 -a 0 hashes.txt rockyou.txt
 ```
 
+
 ![CrackStation cracking 5 of the 6 leaked MD5 hashes instantly: admin123, hunter2, password1, teach123, qwerty](docs/img/md5-crackstation.png)
+
 
 It's instant because MD5 is cheap and **unsalted**, so lookups/rainbow tables work and
 identical passwords share a hash. Five of six crack on the spot; the sixth is just not
@@ -242,7 +252,10 @@ try this on the secure mode
 sqlite3 sms_secure.db "INSERT INTO certifications (student_id,title,grade,issued_date,signature,issued_by) VALUES (4,'PhD in Computer Science','17','2026-01-01',NULL,1)"
 ```
 Shows it as **invalid** and **not on chain**
+
+
 ![alt text](image.png)
+
 
 ## 8. No integrity anchoring — silent grade tampering
 
@@ -262,10 +275,16 @@ sqlite3 sms_secure.db "UPDATE grades SET grade='20.00' WHERE student_id=4 AND co
   value.
 
   After trying to change the grade and going back to dashboard:
+
+
   ![alt text](image-5.png)
 
+
   The System admin got a alter about a tampering detected and by pressing "Restore all from ledger" the grade gets back as the original
+
+
   ![alt text](image-6.png)
+
 
 ## 9. Mass assignment — become admin from your profile
 
@@ -275,9 +294,17 @@ field you send.
 **POC** :
 
 1) go to the profile form and let burp intercept requests , Click "Save Changes"
+
+
 ![alt text](image-3.png)
+
+
 2) add role in the post body and forward the request 
+
+
 ![alt text](image-4.png)
+
+
 3) logging in again gives admin acess
 
 **Secure:** 
@@ -312,11 +339,20 @@ with no sanitisation. Note any existing document id
 Steps:
 
 1) when Student views his uploaded document , a request is sent that retrieve the pdf in the response 
+
+
 ![alt text](image-7.png)
 
+
 2) checking which query paramter wasn't vulnerable but brute forcing multiple commune queries , `?name` made the response different, which indicates it is processed by the api
+
+
 ![alt text](image-8.png)
+
+
 3) Found out it was vulnerable to path traversal which leads to local file disclosure
+
+
  ![alt text](image-9.png)
 
 

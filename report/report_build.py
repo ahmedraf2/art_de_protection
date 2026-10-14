@@ -2,7 +2,7 @@
 """Generate the Meridian Campus Portal security assessment report as self-contained HTML."""
 import base64, os, html
 
-PROJ = "/home/ahmed/tekup/art_de_protection"
+PROJ = os.path.dirname(os.path.abspath(__file__))   # the report/ folder
 OUT  = os.path.join(PROJ, "Meridian_Portal_Security_Report.html")
 
 def img(name):

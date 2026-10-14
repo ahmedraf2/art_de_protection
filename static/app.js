@@ -148,7 +148,7 @@ const NAV = [
   { view: "announcements", label: "Announcements", icon: "📢", roles: ["student", "professor", "admin"] },
   { view: "chat", label: "Chat", icon: "💬", roles: ["student", "professor", "admin"] },
   { view: "courses", label: "Courses", icon: "📚", roles: ["student", "professor", "admin"] },
-  { view: "search", label: "Course search", icon: "🔍", roles: ["student", "professor"] },
+  { view: "search", label: "Course search", icon: "🔍", roles: ["student"] },
   { view: "certifications", label: "Certifications", icon: "🎖️", roles: ["student"] },
   { view: "documents", label: "Documents", icon: "📄", roles: ["student", "admin"] },
   { view: "gradebook", label: "Gradebook", icon: "📝", roles: ["professor"] },
